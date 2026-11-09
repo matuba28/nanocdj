@@ -131,8 +131,8 @@ You need macOS or Linux with:
 - a C compiler for the host tests
 
 ```sh
-git clone --recursive https://github.com/<you>/nanoCDJ.git
-cd nanoCDJ
+git clone --recursive https://github.com/matuba28/nanocdj.git
+cd nanocdj
 make ipod      # -> port/nanoapps/build/nanoCDJ.nanoapp and nanoCDJ.zip
 make test      # host unit tests, no iPod needed
 ```
