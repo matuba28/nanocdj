@@ -1,0 +1,17 @@
+# build output
+port/nanoapps/build/
+tests/build/
+tools/.build/
+*.o
+*.dSYM/
+
+# macOS
+.DS_Store
+
+# never commit music or Rekordbox data
+*.mp3
+*.wav
+*.aif
+*.aiff
+PIONEER/
+.PIONEER/
