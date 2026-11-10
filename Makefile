@@ -35,6 +35,8 @@ test-app: | $(B)
 # the audio output against a simulated RetailOS sound voice, for three counter behaviours
 test-ring: | $(B)
 	$(CC) -O1 -g -Wall -Wno-unused-function -Itests -o $(B)/test_ring tests/test_ring.c && ./$(B)/test_ring 1 && ./$(B)/test_ring 2 && ./$(B)/test_ring 3
+	$(CC) -O1 -g -Wall -Wno-unused-function -Itests -DHANDOVER_TEST -DRING_BLOCK_MS=1000 -DRING_SLOTS=4 -DRING_HANDOVER_JOINS=40 -DSIM_JOIN_LIMIT=100 -o $(B)/test_ring_ho tests/test_ring.c && ./$(B)/test_ring_ho
+	$(CC) -O1 -g -Wall -Wno-unused-function -Itests -DHANDOVER_TEST -DHO_QUICKCHECK -DRING_BLOCK_MS=200 -DRING_SLOTS=4 -DRING_HANDOVER_JOINS=200 -DSIM_JOIN_LIMIT=500 -o $(B)/test_ring_ho200 tests/test_ring.c && ./$(B)/test_ring_ho200
 
 # the freestanding libc/libm of the iPod build, renamed so they don't clash with the host's
 PORT_RENAME := -Dmalloc=t_malloc -Dfree=t_free -Dcalloc=t_calloc -Drealloc=t_realloc -Dqsort=t_qsort \

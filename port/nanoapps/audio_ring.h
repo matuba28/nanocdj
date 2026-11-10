@@ -36,6 +36,9 @@ int  ring_init(ring_render_fn fn, ring_skip_fn skip, void *user);   /* 0 on succ
 void ring_tick(void);                            /* once per frame */
 int  ring_prepare_unload(void);                  /* resident hook: 1 = safe to unload */
 void ring_release(void);                         /* then: free the buffers (integer-only) */
+/* RetailOS allows only ~1,300 block starts per boot (see audio_ring.c). The ring
+ * stops queueing, so the audio stops cleanly, once it has made `starts` of them. */
+void ring_set_budget(uint32_t starts);
 
 typedef struct {
     uint32_t out_rate;      /* mixer rate read off the live voice (0 = unknown yet) */
@@ -45,6 +48,11 @@ typedef struct {
     uint32_t lead_ms;       /* how far ahead of the cursor we write (adapts upward) */
     uint32_t late;          /* ticks that found the cursor past what was written */
     uint32_t skipped_ms;    /* total time handed to the skip callback */
+    uint32_t voice_joins;   /* blocks the current voice has chained through */
+    uint32_t joins_total;
+    uint32_t handovers;     /* times the stream moved to a fresh voice */
+    uint32_t starts;        /* block starts made (each chain join or play) */
+    uint32_t budget;        /* starts allowed (ring_set_budget) */
     int      duration_ok;   /* exact per-block durations are being stated */
     uint32_t ctr_div;       /* voice counter = frames / this (0 = no counter, fallback) */
     uint32_t cal_ratio;     /* last measured block time / audio length, in % */

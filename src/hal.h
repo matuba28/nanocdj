@@ -43,6 +43,9 @@ int32_t hal_file_read(void *f, void *buf, uint32_t n);
 void    hal_file_close(void *f);
 
 uint32_t hal_time_us(void);   /* free-running microseconds, for budgeting work */
+/* Seconds of playback left before the device's audio needs a restart (the iPod's
+ * sound player allows only so many buffer starts per boot); -1 = no such limit. */
+int hal_audio_time_left_s(void);
 size_t   hal_mem_avail(void); /* the most the app may still allocate in one block */
 
 /* Whole-file decode for formats other than MP3 (MP3s are streamed by

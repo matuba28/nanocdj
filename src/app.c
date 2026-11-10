@@ -93,6 +93,7 @@ static struct {
 
 #define ALL_TRACKS 0xffffffffu
 
+#define WARN_LEFT_S (20 * 60)   /* show the restart countdown below this */
 static void status(const char *s) { snprintf(ui.status, sizeof ui.status, "%s", s); ui.status_until = hal_ticks_ms() + 1500; }
 
 /* ================= browser ================= */
@@ -546,8 +547,25 @@ static void draw_deck(void)
     gfx_rect(0, 0, SCREEN_W, HDR_H, C_PANEL);
     gfx_hline(0, SCREEN_W - 1, HDR_H - 1, C_EDGE);
     gfx_text(8, 7, "<", C_ORANGE, 2, 0);
-    gfx_text(28, 4, ui.cur ? ui.cur->title : "NO TRACK", C_TEXT, 1, SCREEN_W - 36);
-    if (ui.cur) gfx_text(28, 15, ui.cur->artist, C_DIM, 1, SCREEN_W - 36);
+    /* the iPod's audio needs a restart after ~2 hours of playing: say how long is left */
+    int left = hal_audio_time_left_s(), tw = SCREEN_W - 36;
+    if (left >= 0 && left < WARN_LEFT_S) {
+        char a[16];
+        pixel_t c = left < 5 * 60 ? C_RED : C_ORANGE;
+        if (left > 0) snprintf(a, sizeof a, "%d MIN", (left + 59) / 60); else snprintf(a, sizeof a, "NOW");
+        gfx_text(SCREEN_W - 6 - gfx_text_w("RESTART", 1), 4, "RESTART", c, 1, 0);
+        gfx_text(SCREEN_W - 6 - gfx_text_w(a, 1), 15, a, c, 1, 0);
+        tw -= 50;
+    }
+    gfx_text(28, 4, ui.cur ? ui.cur->title : "NO TRACK", C_TEXT, 1, tw);
+    if (ui.cur) gfx_text(28, 15, ui.cur->artist, C_DIM, 1, tw);
+    if (left == 0) {
+        gfx_rect(16, 180, 208, 64, C_PANEL); gfx_frame(16, 180, 208, 64, C_RED);
+        gfx_text_center(120, 190, "AUDIO LIMIT REACHED", C_RED, 1);
+        gfx_text_center(120, 206, "RESTART THE IPOD:", C_TEXT, 1);
+        gfx_text_center(120, 220, "HOLD SLEEP + HOME", C_TEXT, 1);
+        return;
+    }
     if (!d.loaded) { gfx_text_center(120, 200, "NO TRACK LOADED", C_DIM, 1); return; }
     draw_overview(&d);
     draw_detail(&d);
@@ -781,6 +799,16 @@ int app_tick(void)
         }
     }
     hal_audio_unlock();
+    /* in the last 10 minutes, a reminder every minute whatever the screen */
+    {
+        static int last_min = -1;
+        int left = hal_audio_time_left_s();
+        if (left > 0 && left < 10 * 60 && left / 60 != last_min) {
+            char m[48]; snprintf(m, sizeof m, "RESTART IPOD: %d MIN OF AUDIO LEFT", (left + 59) / 60);
+            status(m); ui.status_until = hal_ticks_ms() + 4000;
+            last_min = left / 60;
+        }
+    }
     if (ui.scr == SCR_BROWSE) draw_browser(); else draw_deck();
     if (ui.status[0] && hal_ticks_ms() < ui.status_until) {
         int w = gfx_text_w(ui.status, 1) + 16;

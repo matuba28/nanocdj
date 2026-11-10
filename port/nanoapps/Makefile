@@ -18,6 +18,9 @@ RAW_SURFACE := 1
 SRCS := entry.c audio_ring.c   # Thumb / no-FPU side (audio_ring runs the resident's unload hook)
 CHECK_NO_THUMB_FP := 1
 
+# Audio-ring overrides for test builds, e.g. ./build.sh RING_DEFS="-DRING_BLOCK_MS=200"
+RING_DEFS ?=
+EXTRA_CFLAGS += $(RING_DEFS)
 include $(NANOAPPS)/sdk/hb_app.mk
 
 ARM_FLAGS := -marm -mcpu=cortex-a8 -mfloat-abi=softfp -mfpu=vfpv3-d16 -mword-relocations \

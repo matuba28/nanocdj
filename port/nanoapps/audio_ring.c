@@ -45,9 +45,40 @@ typedef void  (*sfx_player_play_t)(void *player, void *desc, void *cb, void *cbd
 #define D_PLAYING  0x64   /* byte: 1 while a voice holds it */
 
 #define RATE        44100u
-#define SLOTS       4u
-#define BLOCK_MAX   9600u        /* frames per slot buffer (200 ms at a 48k mixer) */
-#define BLOCK_DEF   8820u        /* 200 ms: exact at 44.1k / 22.05k mixers */
+#define SLOTS       4u           /* slot array capacity */
+#ifndef RING_SLOTS
+#define RING_SLOTS  2u           /* slots in use: two long blocks alternate */
+#endif
+/* 1 s blocks. Latency doesn't depend on block length (we write just ahead of the
+ * cursor), but the number of chained joins does: on the device the voice died
+ * after ~1,300-1,500 joins (20 ms blocks: ~30 s; 200 ms blocks: ~4-5 min). */
+/* RetailOS's sound-effect player allows only ~1,300 block starts per boot: every
+ * chained join or play() uses one, whatever the voice, and only a restart of the
+ * iPod gives them back (measured: crashes at ~1,230-1,300 with 20 ms, 200 ms and
+ * 1 s blocks, with fresh voices, and across app sessions). Latency doesn't depend
+ * on block length, so blocks are long: 6 s gives ~2 hours per boot. If there isn't
+ * the memory, 3 s then 1 s. The budget itself is enforced by ring_set_budget(). */
+#ifndef RING_BLOCK_MS
+#define RING_BLOCK_MS 6000u
+#endif
+#define BLOCK_DEF   (441u * RING_BLOCK_MS / 10u)   /* frames, exact at 44.1k / 22.05k */
+/* A voice can't chain forever: on the device one died after ~1,300 joins (whatever
+ * the block length), taking the iPod with it (screen off, hard reset). So after
+ * HANDOVER_JOINS the stream moves to a fresh voice: the new one starts XF_FRAMES
+ * before the old one's last block ends, on a copy of that audio, and the two are
+ * crossfaded. Start-time error is about a frame (~16 ms), well inside the fade. */
+#ifndef RING_HANDOVER_JOINS
+/* Off: moving to a fresh voice doesn't give starts back (the limit is shared by
+ * every voice), but the mechanism is kept, tested, for firmware where it might. */
+#define RING_HANDOVER_JOINS 0u
+#endif
+#define XF_FRAMES   2646u          /* 60 ms crossfade window */
+/* A started voice is first read at the mixer's next 1024-frame pass (pass size
+ * measured on the device). Against a simulated mixer with that pass size, aiming
+ * the new voice 128 frames ahead of the cursor estimate made the handover offset
+ * unbiased (mean 0.3 ms, sd 7.5 ms, worst 16 ms): without it every handover left
+ * the music ~3 ms late, half a pass made it ~7 ms early, and those add up. */
+#define HANDOVER_AIM 128u
 #define LEAD_MS     80u          /* written ahead of the estimated cursor */
 #define LEAD_MAX_MS 200u
 #define JITTER_MS   100u         /* tick gaps up to this are cadence, longer ones are stalls */
@@ -71,11 +102,20 @@ static ring_render_fn g_render;
 static ring_skip_fn   g_skip;
 static void    *g_user;
 static uint32_t g_out_rate, g_block = BLOCK_DEF;
+static uint32_t g_cap = BLOCK_DEF;          /* frames each slot buffer holds */
+static uint32_t g_nslots = RING_SLOTS;
+static uint32_t g_starts;                   /* block starts committed (chains + plays) */
+static uint32_t g_budget = 0xffffffffu;     /* starts allowed before stopping */
 /* g_duration_bad starts set: on the device (RetailOS 1.1.2, nano 7G 2012) neither
  * counter = frames nor frames / 2 timed right (blocks ran ~2x long), while no
  * counter at all measured 98-101% for minutes. Starting there avoids ~10 s of
  * calibration glitches; blocks are still timed and reported (NC_CAL). */
+#ifndef RING_FORCE_DIV
 static int      g_duration_bad = 1, g_stopping, g_ready, g_running;
+#else
+/* experiment: state the voice counter as frames / RING_FORCE_DIV and never change it */
+static int      g_duration_bad = 0, g_stopping, g_ready, g_running;
+#endif
 static uint32_t g_w;              /* stream frames written so far */
 static uint32_t g_end;            /* stream frame where the chained blocks end */
 static uint32_t g_head_t;         /* estimated time (us) the FIFO head started sounding */
@@ -84,6 +124,12 @@ static uint32_t g_t_out;          /* us at which the cursor reaches g_w (written
 static uint32_t g_lead_ms = LEAD_MS;
 static uint8_t  g_quiet_ticks;
 static uint32_t g_restarts, g_late, g_skipped_frames;
+static uint32_t g_voice_joins, g_joins_total;   /* chained handovers on the current voice / ever */
+/* voice handover: 0 none, 1 armed (new voice's first block queued, not started),
+ * 2 started (old voice still finishing its last block) */
+static int      g_ho;
+static uint8_t  g_ho_slot, g_ho_tail, g_ho_faded;
+static uint32_t g_ho_t, g_handovers;
 
 /* The voice's length counter (voice+0x48, set from descriptor+0x34) does not
  * count output frames one-for-one on the device: with it set to a block's frame
@@ -92,7 +138,11 @@ static uint32_t g_restarts, g_late, g_skipped_frames;
  * and the divisor is learnt by timing real blocks rather than assumed:
  *   div 1 measured ~2x long -> div 2;  still wrong after that -> no counter at all
  *   (g_duration_bad; entrain's fallback: right speed, a faint click per join). */
+#ifndef RING_FORCE_DIV
 static uint32_t g_ctr_div = 1;
+#else
+static uint32_t g_ctr_div = RING_FORCE_DIV;
+#endif
 static uint32_t g_cal_t0, g_cal_frames, g_cal_settle, g_cal_ratio, g_cal_steps;
 
 static int playing(const slot_t *s) { return U8(s->desc, D_PLAYING) != 0; }
@@ -121,10 +171,10 @@ static uint32_t gcd(uint32_t a, uint32_t b) { while (b) { uint32_t t = a % b; a 
 static void choose_block(void)
 {
     uint32_t unit = g_out_rate / gcd(g_out_rate, 1000u);   /* 441 @ 44.1k, 48 @ 48k */
-    uint32_t n = (BLOCK_DEF + unit / 2) / unit;
+    uint32_t n = (g_cap + unit / 2) / unit;
     if (!n) n = 1;
-    if (unit * n > BLOCK_MAX) n = BLOCK_MAX / unit;
-    g_block = n ? unit * n : BLOCK_DEF;
+    if (unit * n > g_cap) n = g_cap / unit;
+    g_block = n ? unit * n : g_cap;
 }
 
 static void learn_rate(const slot_t *s)
@@ -159,39 +209,74 @@ static void desc_build(slot_t *s)
 
 static void chain(slot_t *s, slot_t *next) { U32(s->desc, D_NEXT) = next ? PTR_TO_U32(next->desc) : 0u; }
 
-static void zero(slot_t *s) { for (uint32_t k = 0; k < BLOCK_MAX * 2u; k++) s->pcm[k] = 0; }
+static void zero(slot_t *s) { for (uint32_t k = 0; k < g_cap * 2u; k++) s->pcm[k] = 0; }
 
 static void drop_queue(void)
 {
     for (uint32_t i = 0; i < g_qn; i++) { slot_t *s = &g_slot[g_q[i]]; chain(s, NULL); s->queued = 0; s->seen = 0; }
     g_qn = 0;
+    g_ho = 0;
 }
 
 static slot_t *free_slot(void)
 {
-    for (uint32_t i = 0; i < SLOTS; i++)
+    for (uint32_t i = 0; i < g_nslots; i++)
         if (!g_slot[i].queued && !playing(&g_slot[i])) return &g_slot[i];
     return NULL;
+}
+
+static void free_slots(void)
+{
+    for (uint32_t i = 0; i < SLOTS; i++) if (g_slot[i].pcm) {
+#ifndef RING_HOST_TEST
+        hb_os_free(g_slot[i].pcm);
+#else
+        free(g_slot[i].pcm);
+#endif
+        g_slot[i].pcm = NULL;
+    }
 }
 
 int ring_init(ring_render_fn fn, ring_skip_fn skip, void *user)
 {
     g_render = fn; g_skip = skip; g_user = user;
-    for (uint32_t i = 0; i < SLOTS; i++) {
-        if (g_slot[i].pcm) continue;
-        if (OS_LARGEST() < BLOCK_MAX * 4u + 128u * 1024u) return -1;   /* never risk the OS allocator */
-        g_slot[i].pcm = (int16_t *)OS_ALLOC(BLOCK_MAX * 4u);
-        if (!g_slot[i].pcm) return -1;
-        zero(&g_slot[i]);
+    g_stopping = 0; g_running = 0; g_qn = 0; g_ho = 0;   /* (a fresh launch zeroes these anyway) */
+    /* the longest blocks that fit, so the per-boot starts last longest */
+    static const uint32_t try_ms[] = { RING_BLOCK_MS, 3000u, 1000u };
+    int ok = 0;
+    for (uint32_t t = 0; t < 3 && !ok; t++) {
+        if (try_ms[t] > RING_BLOCK_MS) continue;
+        uint32_t cap = 441u * try_ms[t] / 10u;
+        ok = 1;
+        for (uint32_t i = 0; i < g_nslots && ok; i++) {
+            if (OS_LARGEST() < cap * 4u + 256u * 1024u) { ok = 0; break; }   /* never risk the OS allocator */
+            g_slot[i].pcm = (int16_t *)OS_ALLOC(cap * 4u);
+            if (!g_slot[i].pcm) ok = 0;
+        }
+        if (!ok) { free_slots(); continue; }
+        g_cap = g_block = cap;
+        for (uint32_t i = 0; i < g_nslots; i++) zero(&g_slot[i]);
     }
+    if (!ok) return -1;
     g_last_tick = OS_NOW_US();
     g_ready = 1;
     return 0;
 }
 
+/* time to move the stream to a fresh voice? (never, with RING_HANDOVER_JOINS 0) */
+static int handover_due(void)
+{
+#if RING_HANDOVER_JOINS
+    return g_qn && !g_ho && g_voice_joins + g_qn >= RING_HANDOVER_JOINS && g_block >= 2u * XF_FRAMES;
+#else
+    return 0;
+#endif
+}
+
 /* Append a zeroed block to the chain (starting a voice if there is none). */
 static int queue_block(uint32_t now)
 {
+    if (g_starts >= g_budget) return 0;     /* out of block starts: let the audio stop, not the iPod */
     slot_t *s = free_slot();
     if (!s) return 0;
     zero(s);
@@ -199,22 +284,83 @@ static int queue_block(uint32_t now)
     s->frames = g_block;
     s->queued = 1; s->seen = 0;
     desc_build(s);
-    if (g_qn) {
+    if (handover_due()) {
+        /* Time for a fresh voice: this block isn't chained. It will start a new
+         * voice XF_FRAMES before the old voice's last block (the current tail) ends,
+         * so it begins with a copy of that block's final XF_FRAMES. */
+        s->start = g_end - XF_FRAMES;
+        g_ho = 1; g_ho_faded = 0;
+        g_ho_slot = (uint8_t)(s - g_slot);
+        g_ho_tail = g_q[g_qn - 1];
+    } else if (g_qn) {
         chain(&g_slot[g_q[g_qn - 1]], s);   /* the voice picks it up itself */
     } else {
         OS_PLAY(s->desc);                   /* chain was empty: start a voice */
         g_restarts++;
+        g_voice_joins = 0;
         g_head_t = now;
         g_running = 1;
         learn_rate(s);
         uint32_t v = U32(s->desc, D_VOICE); /* first block went out with no duration: fix its counter */
         if (g_out_rate && v && !(v & 3u) && duration_ms(s->frames))
             *(volatile uint32_t *)((uint8_t *)U32_TO_PTR(v) + 0x48u) = counter_for(s->frames);
-        g_cal_frames = 0; g_cal_settle = SLOTS;   /* start timing afresh */
+        g_cal_frames = 0; g_cal_settle = g_nslots;   /* start timing afresh */
     }
     g_q[g_qn++] = (uint8_t)(s - g_slot);
-    g_end += s->frames;
+    g_end = s->start + s->frames;
+    if (g_ho != 1 || g_q[g_qn - 1] != g_ho_slot) g_starts++;   /* (a handover block counts when it starts) */
     return 1;
+}
+
+/* Once the overlap has been rendered into the old voice's last block: copy it to
+ * the head of the new voice's first block fading in, and fade it out in place. */
+static void handover_fade(void)
+{
+    slot_t *t = &g_slot[g_ho_tail], *n = &g_slot[g_ho_slot];
+    if (g_ho != 1 || g_ho_faded || g_w < t->start + t->frames) return;
+    int16_t *src = t->pcm + (t->frames - XF_FRAMES) * 2u;
+    for (uint32_t i = 0; i < XF_FRAMES; i++) {
+        int32_t g = (int32_t)((i * 4096u) / XF_FRAMES);           /* 0 .. 4095 */
+        for (uint32_t c = 0; c < 2; c++) {
+            int32_t v = src[2 * i + c];
+#ifndef RING_HOST_TEST
+            n->pcm[2 * i + c] = (int16_t)((v * g) >> 12);
+            src[2 * i + c] = (int16_t)((v * (4096 - g)) >> 12);
+#else
+            n->pcm[2 * i + c] = (int16_t)v;   /* host test: keep the sample values readable */
+#endif
+        }
+    }
+    g_ho_faded = 1;
+}
+
+/* Start the new voice once the old one has reached the crossfade. The tick that
+ * notices is up to a frame late, so first slide the new block's audio left until its
+ * first sample is where the old voice is now: the voices then line up to within the
+ * cursor estimate, and the stream doesn't drift a little later at every handover.
+ * Both fades depend only on the stream position, so they still sum to one at
+ * whatever point the new voice comes in. */
+static void handover_start(uint32_t now, uint32_t cursor)
+{
+    slot_t *t = &g_slot[g_ho_tail], *n = &g_slot[g_ho_slot];
+    if (g_ho != 1 || !g_ho_faded) return;
+    uint32_t aim = cursor + HANDOVER_AIM;                          /* where the old voice will be when the new one is read */
+    if (aim < n->start) return;                                    /* not at the crossfade yet */
+    uint32_t tail_end = t->start + t->frames;
+    if (aim >= tail_end || !playing(t)) return;                    /* missed it: the chain runs dry and restarts */
+    uint32_t d = aim - n->start;
+    if (d && g_qn && g_q[g_qn - 1] == g_ho_slot) {
+        uint32_t keep = n->frames - d;
+        for (uint32_t i = 0; i < keep * 2u; i++) n->pcm[i] = n->pcm[i + d * 2u];
+        for (uint32_t i = keep * 2u; i < n->frames * 2u; i++) n->pcm[i] = 0;
+        n->start += d;
+        g_end = n->start + n->frames;
+    }
+    if (g_starts >= g_budget) return;
+    OS_PLAY(n->desc);
+    g_starts++;
+    g_ho = 2; g_ho_t = now;
+    g_voice_joins = 0; g_handovers++;
 }
 
 /* Render stream frames [g_w, target) into the queued blocks that hold them. */
@@ -241,7 +387,7 @@ static void skip(uint32_t frames)
 /* Time real blocks: `k` blocks just finished (seen at this tick). Over ~1.6 s of
  * blocks, compare the time taken with the audio they held. Ticks are ~16 ms apart,
  * so over that window the measurement is good to ~2%. */
-#define CAL_FRAMES (8u * BLOCK_DEF)
+#define CAL_FRAMES (12u * 44100u)   /* measure over >= 12 s of blocks */
 static void calibrate(uint32_t now, uint32_t k)
 {
     if (!g_out_rate) return;
@@ -259,10 +405,13 @@ static void calibrate(uint32_t now, uint32_t k)
     g_cal_steps++;
     g_cal_t0 = now; g_cal_frames = 0;
     if (g_duration_bad) return;                                      /* fallback: just keep reporting */
+#ifdef RING_FORCE_DIV
+    return;                                                          /* experiment: report only */
+#endif
     if (g_cal_ratio >= 85u && g_cal_ratio <= 115u) return;           /* right */
     if (g_ctr_div == 1u && g_cal_ratio >= 160u && g_cal_ratio <= 240u) g_ctr_div = 2u;
     else g_duration_bad = 1;                                         /* give up on the counter */
-    g_cal_settle = SLOTS;
+    g_cal_settle = g_nslots;
 }
 
 /* Follow the voice down the FIFO. Blocks ahead of the sounding one have finished;
@@ -291,10 +440,11 @@ static int follow(uint32_t now)
 
     if (k > 0) {
         calibrate(now, (uint32_t)k);
-        uint32_t pred = g_head_t;
-        for (int i = 0; i < k; i++) pred += frames_to_us(g_slot[g_q[i]].frames);
+        g_voice_joins += (uint32_t)k; g_joins_total += (uint32_t)k;
+        uint32_t pred = g_head_t + frames_to_us(g_slot[g_q[k]].start - g_slot[g_q[0]].start);
         if (since(pred, g_last_tick) < 0) pred = g_last_tick;
         if (since(pred, now) > 0) pred = now;
+        if (g_ho == 2 && g_q[k] == g_ho_slot) { pred = g_ho_t; g_ho = 0; }   /* the new voice: we know when it started */
         g_head_t = pred;
         for (int i = 0; i < k; i++) { slot_t *s = &g_slot[g_q[i]]; chain(s, NULL); s->queued = 0; s->seen = 0; }
         for (uint32_t i = (uint32_t)k; i < g_qn; i++) g_q[i - (uint32_t)k] = g_q[i];
@@ -354,6 +504,8 @@ void ring_tick(void)
         if (!queue_block(now)) break;
     if (target > g_end) target = g_end;
     render_to(target);
+    handover_fade();
+    handover_start(now, cursor);
 
     g_t_out = now + frames_to_us(g_w - cursor);
     g_last_tick = now;
@@ -392,10 +544,14 @@ void ring_release(void)
     g_qn = 0; g_ready = 0; g_running = 0;
 }
 
+void ring_set_budget(uint32_t starts) { g_budget = starts; }
+
 void ring_stats(ring_stats_t *s)
 {
+    s->starts = g_starts; s->budget = g_budget;
     s->out_rate = g_out_rate; s->block_frames = g_block; s->queued = g_qn;
     s->restarts = g_restarts; s->lead_ms = g_lead_ms; s->late = g_late;
+    s->voice_joins = g_voice_joins; s->joins_total = g_joins_total; s->handovers = g_handovers;
     s->skipped_ms = (uint32_t)(((uint64_t)g_skipped_frames * 10u) / 441u);
     s->duration_ok = !g_duration_bad && duration_ms(g_block) != 0;
     s->ctr_div = g_duration_bad ? 0 : g_ctr_div;

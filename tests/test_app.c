@@ -14,6 +14,8 @@ void *hal_read_file(const char *p, size_t *s) { (void)p; (void)s; return NULL; }
 int hal_decode_audio(const char *p, hal_pcm *o) { (void)p; o->frames = AUDIO_RATE * 60; o->data = calloc((size_t)o->frames * 2, sizeof(float)); return 0; }
 void hal_free_pcm(hal_pcm *p) { free(p->data); p->data = NULL; }
 #include "hal_files_host.h"
+static int time_left = -1;
+int hal_audio_time_left_s(void) { return time_left; }
 
 static void ev(hal_ev_type type, int x, int y) { hal_event e = { 0 }; e.type = type; e.x = x; e.y = y; evq[evt++] = e; }
 static void tap(int x, int y) { ev(EV_TOUCH_DOWN, x, y); ev(EV_TOUCH_UP, x, y); app_tick(); }
@@ -137,6 +139,17 @@ int main(void)
         e.button = BTN_VOLUP; evq[evt++] = e; e.button = BTN_VOLDOWN; evq[evt++] = e; e.button = BTN_PLAYPAUSE; evq[evt++] = e;
         app_tick();
         CHECK(ui.deck.pitch == p0 && ui.deck.playing == playing, "volume and play/pause buttons ignored");
+    }
+
+    /* the restart countdown: header from 20 min, reminders in the last 10, limit screen at 0 */
+    {
+        ui.scr = SCR_DECK;
+        time_left = 25 * 60; app_tick();
+        CHECK(ui.status[0] == 0 || hal_ticks_ms() >= ui.status_until || !strstr(ui.status, "RESTART"), "no reminder above 10 min");
+        time_left = 9 * 60 + 30; app_tick();
+        CHECK(strstr(ui.status, "RESTART IPOD: 10 MIN") != NULL, "reminder in the last 10 min: '%s'", ui.status);
+        time_left = 0; app_tick();                                 /* limit screen draws without crashing */
+        time_left = -1; app_tick();
     }
 
     printf(fails ? "%d FAILED\n" : "all app tests passed\n", fails);

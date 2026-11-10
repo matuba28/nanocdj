@@ -120,9 +120,78 @@ static void ring_render(int16_t *out, uint32_t frames, void *user)
 /* ring callback: the output missed this much time (stall / screen lock) */
 static void ring_skip(uint32_t frames, void *user) { (void)user; app_audio_skip(frames); }
 
+/* ---------------- block-start budget ----------------
+ * RetailOS's sound-effect player allows only ~1,300 block starts per boot, across
+ * every app session, and the iPod hard-resets past that (see audio_ring.c). The
+ * starts used this boot are saved to a small file, so reopening nanoCDJ carries the
+ * count on, and the ring stops the audio at BOOT_START_LIMIT instead of crashing.
+ * A boot is recognised by its start time: the real-time clock minus the 64-bit
+ * hardware uptime counter (the SDK's ms clock restarts with each app). */
+#define BOOT_START_LIMIT 1200u                 /* crashes seen at ~1,230-1,300 */
+#define STATE_DIR  "/Data/nanoCDJ"
+#define STATE_PATH "/Data/nanoCDJ/boot.bin"
+#define STATE_MAGIC 0x4e434253u                /* 'NCBS' */
+typedef struct { uint32_t magic; int32_t boot_s; uint32_t starts; } boot_state_t;
+static int32_t  boot_s;                        /* this boot's start, s since 2000 */
+static uint32_t prev_starts, saved_starts;     /* used by earlier sessions this boot / last saved total */
+
+static uint64_t hw_uptime_us(void)             /* the SoC's free-running us counter, 64-bit */
+{
+    volatile uint32_t *hi = (volatile uint32_t *)0x3c700080u, *lo = (volatile uint32_t *)0x3c700084u;
+    uint32_t h1, l, h2;
+    do { h1 = *hi; l = *lo; h2 = *hi; } while (h1 != h2);
+    return ((uint64_t)h1 << 32) | l;
+}
+
+static int32_t days_since_2000(int y, int m, int d)
+{
+    y -= m <= 2; int era = y / 400, yoe = y - era * 400;                       /* civil-from-days, inverted */
+    int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1, doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 730425;                                       /* 2000-03-01 based -> 2000-01-01 */
+}
+
+static void budget_init(void)
+{
+    hb_rtc_time_t t; hb_rtc_read(&t);
+    int32_t now_s = days_since_2000(t.year, t.month, t.day_of_month) * 86400 + t.hours * 3600 + t.minutes * 60 + t.seconds;
+    boot_s = now_s - (int32_t)(hw_uptime_us() / 1000000u);
+    boot_state_t st;
+    prev_starts = 0;
+    if (hb_fs_read(STATE_PATH, &st, sizeof st) == sizeof st && st.magic == STATE_MAGIC &&
+        st.boot_s - boot_s < 30 && boot_s - st.boot_s < 30)                   /* same boot */
+        prev_starts = st.starts;
+    saved_starts = prev_starts;
+    ring_set_budget(prev_starts < BOOT_START_LIMIT ? BOOT_START_LIMIT - prev_starts : 0);
+    hb_trace_log("NC_BOOT", prev_starts, (uint32_t)boot_s);
+}
+
+static void budget_save(void)
+{
+    static uint32_t last; static int dir;
+    uint32_t now = hb_time_uptime_ms();
+    if (now - last < 30000u) return;
+    last = now;
+    ring_stats_t r; ring_stats(&r);
+    uint32_t total = prev_starts + r.starts;
+    if (total == saved_starts) return;
+    if (!dir) { hb_fs_mkdir(STATE_DIR); dir = 1; }
+    boot_state_t st = { STATE_MAGIC, boot_s, total };
+    if (hb_fs_write(STATE_PATH, &st, sizeof st)) saved_starts = total;
+}
+
+/* seconds of playback left before the iPod needs a restart; -1 if not known */
+int hal_audio_time_left_s(void)
+{
+    if (!ring_ok) return -1;
+    ring_stats_t r; ring_stats(&r);
+    uint32_t left = r.budget > r.starts ? r.budget - r.starts : 0;
+    return (int)((uint64_t)left * r.block_frames / 44100u);
+}
+
 static void start_audio_output(void)
 {
     ring_ok = acb && ring_init(ring_render, ring_skip, NULL) == 0;
+    if (ring_ok) budget_init();
     hb_trace_log("NC_AUDIO", (uint32_t)ring_ok, hb_os_heap_largest());
 }
 
@@ -146,6 +215,8 @@ static void audio_trace(void)
         ring_stats_t st; ring_stats(&st);
         hb_trace_log("NC_RING", st.restarts | (st.late << 16), st.out_rate | (st.lead_ms << 20));
         hb_trace_log("NC_CAL", st.ctr_div | (st.cal_steps << 8), st.cal_ratio);
+        /* NC_JOIN v1 = starts this session | earlier sessions this boot << 16, v2 = block frames */
+        hb_trace_log("NC_JOIN", st.starts | (prev_starts << 16), st.block_frames);
     }
     hb_trace_log("NC_HEAP", hb_os_heap_free(), hb_os_heap_largest());
     mp3s_stats_t ms;
@@ -173,6 +244,7 @@ static void run_audio(void)
 {
     if (!acb) return;
     audio_trace();
+    if (ring_ok) budget_save();
     if (ring_ok) {
         uint32_t t0 = hb_time_uptime_us();
         ring_tick();

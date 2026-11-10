@@ -88,9 +88,14 @@ NanoApps can't stop that. Set your volume before you start.
   re-read the file to get there, since the iPod can't seek within a file.
 - Hot cues and memory cues show on the waveforms (the first memory cue is loaded as the
   cue point), but there are no hot cue buttons, cue lists, sync or key lock yet.
-- The iPod's system loses a little memory while audio plays (~90 bytes/s, roughly 12
-  hours before it matters). Restart the iPod before a long set to be safe: hold
-  Sleep/Wake + Home until the Apple logo appears.
+- **About 2 hours of playing per iPod restart.** The iPod's sound player can only
+  start ~1,300 audio buffers per boot, then crashes, and only a restart resets it.
+  nanoCDJ uses long buffers to make that last ~2 hours, counts across app sessions,
+  shows a **RESTART … MIN** countdown in the deck header from 20 minutes left, and
+  stops the audio cleanly at the limit instead of crashing. **Restart the iPod before
+  a set:** hold Sleep/Wake + Home until the Apple logo appears.
+- Leaving nanoCDJ can take a few seconds (the iPod finishes its current audio buffer
+  first); if another app doesn't open on the first tap, tap again.
 
 ## Possible future upgrades
 
@@ -112,6 +117,9 @@ Ideas, roughly from most to least requested. Contributions welcome.
 - **Beat jump and loop moves.** Jump or shift a loop by 1–32 beats on the grid.
 - **Key lock (master tempo).** Change tempo without changing pitch. Needs a
   time-stretcher cheap enough for the iPod's CPU.
+- **Lifting the 2-hour limit.** Find what RetailOS's sound-effect player uses up with
+  every buffer start (it's only given back by a restart): by disassembling the
+  firmware, or with the NanoApps authors, who reverse-engineered this player.
 - **Lower latency.** Writing closer to the play cursor (now ~80 ms ahead) would make the
   jog feel tighter. It needs measuring how far ahead the iPod's mixer really reads.
 - **Search and memory cues.** Search the library by name, and add or remove memory

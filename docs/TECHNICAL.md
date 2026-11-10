@@ -49,19 +49,33 @@ byte is 1 while a voice holds it, so finished buffers are known for certain.
 
 What it took on the nano (each found from the trace):
 
-- **Blocks must be long.** 20 ms blocks crackled at every join and rebooted the iPod
-  after ~30 s. The mixer pulls in 1024-frame passes, and a buffer shorter than a pass
-  breaks its accounting. Blocks are now ~200 ms (8820 frames at 44.1 kHz).
+- **~1,300 block starts per boot, then a hard reset.** Every block a voice starts
+  (each chained join, and each `play()`) uses up something in RetailOS's sound-effect
+  player that is never given back until the iPod restarts. Past ~1,230–1,300 starts
+  the screen goes dark and the iPod hard-resets, with no log surviving. Measured with
+  20 ms blocks (crash after ~30 s), 200 ms (~4½ min) and 1 s (~21 min), and it holds
+  across fresh voices (a crossfaded handover to a new voice every 300 joins didn't
+  help) and across app sessions (3 min, leave, reopen: crashed 1½ min later). Giving
+  the voice a stated length doesn't help either (see below).
+- **So blocks are long:** two alternating 6 s blocks (2 × 1.06 MB; 3 s or 1 s if the
+  memory isn't there at launch). That's one start per 6 s, ~2 hours per boot. The
+  starts used this boot are saved to `/Data/nanoCDJ/boot.bin` every 30 s, so reopening
+  the app carries the count on; a boot is recognised by RTC time minus the 64-bit
+  hardware uptime counter. The deck shows a restart countdown from 20 minutes left,
+  and at 1,200 starts the ring stops queueing: the audio stops, the iPod doesn't
+  crash. (The heap the OS loses while audio plays also dropped, from ~40–90 to ~5
+  bytes/s, with the start rate.) Short blocks are also bad for another reason: under
+  a mixer pass (1024 frames) they break the voice's accounting and crackle.
 - **Latency comes from where we write, not block size.** Each block is zeroed when
   chained, and every frame renders only up to ~80 ms ahead of the estimated play
   cursor, into blocks the voice is already playing. The voice reads our buffers live.
   The cursor is estimated from the µs clock and re-pinned whenever the "playing" flag
   moves to the next block, so it can't drift (tested against ±120 ppm clock error).
 - **No length counter.** entrain sets the voice's sample counter (descriptor `+0x34` in
-  ms → voice `+0x48`). On this unit, stating it as `frames` made every 200 ms block take
-  ~385 ms: our audio then as much silence, so the deck ran at half speed. `frames / 2`
-  didn't time right either. Leaving it at 0 (entrain's fallback) measured 98–101 % for
-  minutes. nanoCDJ starts at 0 and keeps timing blocks (`NC_CAL`).
+  ms → voice `+0x48`). On this unit the counter is played as silence *after* the PCM:
+  stating `frames` made a block take ~193 % of its length, `frames / 2` ~150 %
+  (audible gaps), 0 exactly 100 %. nanoCDJ states none and keeps timing blocks
+  (`NC_CAL`).
 - **Stalls stay in time.** If frames stop (screen lock, a slow load), the voice runs
   into zeroed buffer and stops: silence, never stale audio. When frames resume, the
   deck is moved on by the missed time (`deck_skip`), so the track stays in phase with
@@ -69,8 +83,11 @@ What it took on the nano (each found from the trace):
 - The screen is kept from auto-dimming with the same idle-clock poke as the SDK's
   `hb_wake_lock` (which only exists for LVGL apps).
 
-`make test-ring` runs the ring against a simulated voice that models chaining, mixer
-read-ahead, clock drift and the counter behaviours above.
+`make test-ring` runs the ring against a simulated sound player that models chaining,
+mixer read-ahead in 1024-frame passes, clock drift, the counter behaviour, several
+voices mixing, and the per-boot start limit (the budget must stop the audio before
+the simulated iPod "crashes"). The voice handover (`RING_HANDOVER_JOINS`, off by
+default) is tested there too, with its own block settings.
 
 ## Streaming MP3
 
@@ -137,8 +154,10 @@ tracks. LAME's stated encoder delay is not trimmed.
   (`nanocdj_prepare_unload`) waits for the voice to finish, closes the file, and frees
   every block. It runs on the resident's task, which has no FPU, so that path is
   integer-only (checked in the disassembly).
-- While audio plays, the OS heap shrinks by ~40–90 bytes/s outside nanoCDJ's
-  allocations, probably in the sound player. A restart clears it.
+- While audio plays, the OS heap shrinks by ~5 bytes/s outside nanoCDJ's allocations
+  (it was 40–90 with short blocks: it follows the block-start rate). A restart clears it.
+- Leaving the app waits for the voice to finish the block it's on (silenced), now up
+  to 6 s: an app launched within that time needs a second tap.
 
 ## Buttons
 
@@ -159,6 +178,8 @@ Read with `python3 tools/trace.py 100 --only NC_` while nanoCDJ is running.
 | `NC_AUDIO` | launch | audio ring started | largest block |
 | `NC_RING` | every 5 s | voice starts \| late ticks << 16 | mixer rate \| lead ms << 20 |
 | `NC_CAL` | every 5 s | counter divisor (0 = none) \| measurements << 8 | last block time / length, % |
+| `NC_JOIN` | every 5 s | block starts this session \| earlier sessions this boot << 16 | block length, frames |
+| `NC_BOOT` | launch | block starts used earlier this boot | boot start time, s since 2000 |
 | `NC_HEAP` | every 5 s | heap free | largest free block |
 | `NC_GAP` | every 5 s | longest gap between frames, µs | frames > 25 ms apart |
 | `NC_COST` | every 5 s | slowest app_tick, µs | slowest audio render, µs |

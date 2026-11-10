@@ -10,45 +10,77 @@
 uint32_t sim_now_us;
 sim_voice_t sim_voice;
 int sim_voices_started, sim_double_voice;
-static uint8_t *cur;              /* descriptor the voice is reading, NULL = idle */
-static uint32_t pos;              /* frame within it */
-static uint64_t short_blocks;
 
+/* Voices: each follows its own chain; up to three can sound at once and are mixed.
+ * Like the device, a voice that has chained more than SIM_JOIN_LIMIT blocks dies,
+ * and that "crashes the iPod" (sim_crashed). */
+#ifndef SIM_JOIN_LIMIT
+#define SIM_JOIN_LIMIT 1300u
+#endif
+typedef struct { uint8_t *cur; uint32_t pos, joins, seq; } voice_t;
+static voice_t vo[3];
+static uint32_t seq_counter, max_joins;
+static int sim_crashed;
+static uint64_t short_blocks, overlap_frames, overlap_max, overlap_run;
 static uint32_t factor = 2;      /* device: the length counter runs at half speed */
-static void take(uint8_t *d)
+
+static int active_voices(void) { int n = 0; for (int i = 0; i < 3; i++) if (vo[i].cur) n++; return n; }
+
+/* the device's real limit: block starts are shared by every voice, per boot */
+static uint32_t sim_total_starts, sim_total_limit = 0xffffffffu;
+static void take(voice_t *v, uint8_t *d)
 {
-    cur = d; pos = 0;
+    if (++sim_total_starts > sim_total_limit) sim_crashed = 1;
+    v->cur = d; v->pos = 0;
     sim_voice.counter = U32(d, D_DURATION) * sim_voice.out_rate / 1000u;   /* setSource */
     U8(d, D_PLAYING) = 1;
     U32(d, D_VOICE) = PTR_TO_U32(&sim_voice);
     if (U32(d, D_BUF_LEN) / 4u < SIM_PASS) short_blocks++;
 }
-void sim_play(uint8_t *d) { sim_voices_started++; if (cur) sim_double_voice++; take(d); }
+void sim_play(uint8_t *d)
+{
+    sim_voices_started++;
+    if (active_voices()) sim_double_voice++;
+    for (int i = 0; i < 3; i++) if (!vo[i].cur) { vo[i].joins = 0; vo[i].seq = ++seq_counter; take(&vo[i], d); return; }
+    sim_crashed = 1;                                                /* more voices than the pool */
+}
 
 /* ---- mixer + DAC ---- */
 static uint32_t fifo[4 * SIM_PASS]; static uint32_t fifo_n, fifo_h;   /* fetched, not yet heard */
 static uint8_t fifo_real[4 * SIM_PASS];
+static uint32_t fifo_seq[4 * SIM_PASS];
 
-static void mixer_pass(void)     /* pull one pass from the chain */
+static void mixer_pass(void)     /* pull one pass from every voice */
 {
     for (uint32_t i = 0; i < SIM_PASS; i++) {
-        uint32_t v = 0; int real = 0;
-        if (cur) {
-            int16_t *pcm = (int16_t *)U32_TO_PTR(U32(cur, D_BUF_A));
-            uint32_t len = U32(cur, D_BUF_LEN) / 4u;
+        uint32_t v = 0; int real = 0; uint32_t best_seq = 0;
+        int n_active = 0;
+        for (int k = 0; k < 3; k++) {
+            voice_t *x = &vo[k];
+            if (!x->cur) continue;
+            n_active++;
+            int16_t *pcm = (int16_t *)U32_TO_PTR(U32(x->cur, D_BUF_A));
+            uint32_t len = U32(x->cur, D_BUF_LEN) / 4u;
             /* past the PCM the voice pads silence until its counter runs out */
-            v = pos < len ? ((uint16_t)pcm[pos * 2] | (uint32_t)(uint16_t)pcm[pos * 2 + 1] << 16) : 0;
-            real = 1;
+            uint32_t val = x->pos < len ? ((uint16_t)pcm[x->pos * 2] | (uint32_t)(uint16_t)pcm[x->pos * 2 + 1] << 16) : 0;
+            /* the "speaker" hears the newest voice (in a handover it carries the stream on) */
+            if (x->seq > best_seq) { best_seq = x->seq; v = val; real = 1; }
             uint32_t end = sim_voice.counter ? sim_voice.counter * factor : len;
-            if (++pos >= end) {                                  /* completion handler */
-                uint8_t *next = (uint8_t *)U32_TO_PTR(U32(cur, D_NEXT));
-                U8(cur, D_PLAYING) = 0;
-                cur = NULL;
-                if (next) take(next);
+            if (++x->pos >= end) {                               /* completion handler */
+                uint8_t *next = (uint8_t *)U32_TO_PTR(U32(x->cur, D_NEXT));
+                U8(x->cur, D_PLAYING) = 0;
+                x->cur = NULL;
+                if (next) {
+                    if (++x->joins > max_joins) max_joins = x->joins;
+                    if (x->joins > SIM_JOIN_LIMIT) sim_crashed = 1;
+                    take(x, next);
+                }
             }
         }
+        if (n_active > 1) { overlap_frames++; if (++overlap_run > overlap_max) overlap_max = overlap_run; }
+        else overlap_run = 0;
         uint32_t at = (fifo_h + fifo_n) % (4 * SIM_PASS);
-        fifo[at] = v; fifo_real[at] = (uint8_t)real; fifo_n++;
+        fifo[at] = v; fifo_real[at] = (uint8_t)real; fifo_seq[at] = best_seq; fifo_n++;
     }
 }
 
@@ -58,12 +90,20 @@ static int64_t phase_min, phase_max, last_phase; static int have_phase;
 static uint64_t dac_frames;      /* DAC clock: frames output so far */
 static uint32_t last_v;
 
-static void hear(uint32_t v, int real)
+static uint32_t last_seq; static uint64_t ho_switches; static int64_t ho_disc_max;
+static void hear(uint32_t v, int real, uint32_t seq)
 {
     dac_frames++;
     if (!real) { silent++; return; }
     if (v == 0) { dropouts++; return; }                      /* zeroed buffer: written too late */
-    if (heard && v != last_v + 1) { if (v <= last_v) repeats++; else jumps++; }
+    int switched = heard && seq != last_seq;                  /* a handover to a new voice */
+    last_seq = seq;
+    if (switched) {
+        int64_t d = (int64_t)v - (int64_t)(last_v + 1);       /* how far off the two voices were */
+        if (d < 0) d = -d;
+        if (d > ho_disc_max) ho_disc_max = d;
+        ho_switches++;
+    } else if (heard && v != last_v + 1) { if (v <= last_v) repeats++; else jumps++; }
     last_v = v; heard++;
     int64_t ph = (int64_t)v - (int64_t)dac_frames;
     if (!have_phase) { phase_min = phase_max = ph; have_phase = 1; }
@@ -82,7 +122,7 @@ static void sim_run(uint32_t ms)  /* advance real time; the DAC drains at dac_ra
         while (dac_frac >= 1.0) {
             dac_frac -= 1.0;
             if (fifo_n < SIM_PASS) mixer_pass();             /* double-buffered: prefetch a pass */
-            hear(fifo[fifo_h], fifo_real[fifo_h]);
+            hear(fifo[fifo_h], fifo_real[fifo_h], fifo_seq[fifo_h]);
             fifo_h = (fifo_h + 1) % (4 * SIM_PASS); fifo_n--;
         }
     }
@@ -106,6 +146,46 @@ static int fails;
 
 static void frames60(int n) { for (int f = 0; f < n; f++) { ring_tick(); sim_run(f % 3 == 2 ? 16 : 17); } }
 
+#ifdef HANDOVER_TEST
+/* Voices die after SIM_JOIN_LIMIT joins; the ring must keep handing over to fresh
+ * ones for as long as it plays, with the stream continuous across every handover. */
+int main(void)
+{
+    sim_voice.out_rate = 44100;
+    sim_now_us = 5000000;
+    CHECK(ring_init(render, skipfn, NULL) == 0, "init");
+    frames60(60 * 20); reset_ears();
+    srand(3);
+    for (int f = 0; f < 60 * 60 * 20; f++) {                  /* 20 minutes, uneven frames */
+        ring_tick();
+        sim_run(f % 7 == 0 ? 5 + (uint32_t)(rand() % 35) : (f % 3 == 2 ? 16 : 17));
+    }
+    ring_stats_t st; ring_stats(&st);
+    printf("20 min: %u handovers, longest voice %u joins (limit %u), worst handover offset %.1f ms, "
+           "longest overlap %.1f ms, %llu dropouts, phase spread %.1f ms\n",
+           st.handovers, max_joins, SIM_JOIN_LIMIT, ho_disc_max / 44.1, overlap_max / 44.1,
+           (unsigned long long)dropouts, (phase_max - phase_min) / 44.1);
+    CHECK(!sim_crashed, "a voice went past the join limit (max %u)", max_joins);
+    CHECK(st.handovers >= 20, "kept handing over (%u)", st.handovers);
+    CHECK(ho_switches == st.handovers, "each handover switched voices once (%llu vs %u)", (unsigned long long)ho_switches, st.handovers);
+    CHECK(ho_disc_max <= 44100 / 1000 * 20, "new voice within 20 ms of the old (%.1f ms)", ho_disc_max / 44.1);
+    CHECK(overlap_max <= XF_FRAMES + 44100 / 50, "voices overlap only for the crossfade (%.1f ms)", overlap_max / 44.1);
+    CHECK(dropouts == 0 && repeats == 0 && jumps == 0, "continuous apart from handovers: %llu dropouts %llu repeats %llu jumps",
+          (unsigned long long)dropouts, (unsigned long long)repeats, (unsigned long long)jumps);
+    /* each handover lands within a few ms either way, unbiased: over 32 of them that
+     * random walk stays well under 0.1 s (in use there's one every 10 minutes) */
+#ifndef HO_QUICKCHECK
+    CHECK(phase_max - phase_min < 44100 / 10, "stays on the wall clock (spread %.1f ms)", (phase_max - phase_min) / 44.1);
+#else
+    /* 200 ms blocks (the quick device check only): HANDOVER_AIM is tuned for the real
+     * 1 s blocks, here each handover lands ~4 ms early on average */
+    CHECK(phase_max - phase_min < 44100 / 4, "stays near the wall clock (spread %.1f ms)", (phase_max - phase_min) / 44.1);
+#endif
+    CHECK(st.restarts == 1, "never had to restart from dry (%u)", st.restarts);
+    printf(fails ? "%d FAILED\n" : "handover tests passed\n", fails);
+    return fails != 0;
+}
+#else
 int main(int argc, char **argv)
 {
     if (argc > 1) factor = (uint32_t)atoi(argv[1]);
@@ -115,7 +195,7 @@ int main(int argc, char **argv)
     CHECK(ring_init(render, skipfn, NULL) == 0, "init");
 
     /* 0. calibration: within a few seconds the block timing is learnt */
-    frames60(60 * 10);
+    frames60(60 * 40);
     ring_stats_t cs; ring_stats(&cs);
     printf("calibrated: counter divisor %u (0 = no counter), last ratio %u%%, %u measurements\n", cs.ctr_div, cs.cal_ratio, cs.cal_steps);
     CHECK(cs.ctr_div == 0, "starts and stays without a counter (what works on the device)");
@@ -128,7 +208,7 @@ int main(int argc, char **argv)
     CHECK(dropouts == 0 && repeats == 0 && jumps == 0, "steady: dropouts %llu repeats %llu jumps %llu",
           (unsigned long long)dropouts, (unsigned long long)repeats, (unsigned long long)jumps);
     CHECK(sim_voices_started == 1, "steady: voices started %d", sim_voices_started);
-    CHECK(st.out_rate == 44100 && st.block_frames == 8820 && st.duration_ok == 0, "rate %u block %u dur %d", st.out_rate, st.block_frames, st.duration_ok);
+    CHECK(st.out_rate == 44100 && st.block_frames == BLOCK_DEF && st.duration_ok == 0, "rate %u block %u dur %d", st.out_rate, st.block_frames, st.duration_ok);
     double lat = (counter - last_v) / 44.1;
     printf("steady: latency %.1f ms (lead %u ms), %u blocks queued\n", lat, st.lead_ms, st.queued);
     CHECK(lat < 130, "latency %.1f ms", lat);
@@ -165,32 +245,35 @@ int main(int argc, char **argv)
      *    restarts once, and the source has moved on by the time that passed */
     reset_ears();
     uint64_t heard_before = heard;
-    sim_run(5000);
-    CHECK(cur == NULL, "lock: voice stopped");
-    CHECK(heard - heard_before < 44100 / 2, "lock: only the queued tail played (%llu frames)", (unsigned long long)(heard - heard_before));
+    /* long enough for the queued tail (up to two blocks) to run out */
+    uint32_t lock_ms = 2000u + 2u * RING_BLOCK_MS;
+    sim_run(lock_ms);
+    CHECK(active_voices() == 0, "lock: voice stopped");
+    CHECK(heard - heard_before <= (uint64_t)BLOCK_DEF * 2u + 44100u, "lock: only the queued tail played (%llu frames)", (unsigned long long)(heard - heard_before));
     int v0 = sim_voices_started;
     frames60(120);
-    printf("5 s lock: restarts %d, phase moved %.1f ms\n", sim_voices_started - v0, (last_phase - phase0) / 44.1);
+    printf("%u s lock: restarts %d, phase moved %.1f ms\n", lock_ms / 1000u, sim_voices_started - v0, (last_phase - phase0) / 44.1);
     CHECK(sim_voices_started == v0 + 1, "lock: one restart (%d)", sim_voices_started - v0);
-    CHECK(sim_double_voice == 0, "never two voices at once");
     CHECK(repeats == 0, "lock: nothing replayed");
     CHECK(llabs(last_phase - phase0) < 662, "lock: within 15 ms of the wall clock (%.1f ms)", (last_phase - phase0) / 44.1);
 
     /* 6. 48 kHz mixer: blocks re-sized so the duration is exact */
     uint32_t div_was = g_ctr_div; int bad_was = g_duration_bad; g_ctr_div = 1; g_duration_bad = 0;
     g_out_rate = 48000; choose_block();
-    CHECK(g_block % 48 == 0 && g_block > 8000 && duration_ms(g_block) * 48 == g_block && g_block <= BLOCK_MAX, "48k block %u dur %u", g_block, duration_ms(g_block));
+    CHECK(g_block % 48 == 0 && g_block * 10u > g_cap * 9u && duration_ms(g_block) * 48 == g_block && g_block <= g_cap, "48k block %u dur %u", g_block, duration_ms(g_block));
     g_out_rate = 44100; choose_block(); g_ctr_div = div_was; g_duration_bad = bad_was;
 
     CHECK(short_blocks == 0, "a block shorter than a mixer pass was played (%llu)", (unsigned long long)short_blocks);
-    CHECK(sim_double_voice == 0, "two voices at once (%d)", sim_double_voice);
+    { ring_stats_t hs; ring_stats(&hs);
+      CHECK((uint32_t)sim_double_voice == hs.handovers, "two voices only ever overlap in a handover (%d vs %u)", sim_double_voice, hs.handovers); }
+    CHECK(!sim_crashed, "no voice went past the join limit (max %u joins)", max_joins);
 
     /* 7. unload: not safe while a voice holds a descriptor, safe once it ends, never loops */
     frames60(20);
     CHECK(ring_prepare_unload() == 0, "unload refused while playing");
-    sim_run(1000);
+    sim_run(RING_BLOCK_MS + 200u);                           /* the sounding block plays out (silenced) */
     CHECK(ring_prepare_unload() == 1, "unload allowed after the voice finished");
-    CHECK(cur == NULL, "voice stopped");
+    CHECK(active_voices() == 0, "voice stopped");
     uint64_t before = heard;
     ring_tick(); sim_run(300);
     CHECK(heard == before, "nothing plays after unload");
@@ -200,6 +283,25 @@ int main(int argc, char **argv)
     for (uint32_t i = 0; i < SLOTS; i++) CHECK(g_slot[i].pcm == NULL, "slot %u freed", i);
     CHECK(ring_init(render, skipfn, NULL) == 0, "re-init after release");
 
+    /* 9. budget: the device crashes after ~1,300 starts per boot, shared by every
+     *    voice. With a budget below that, the audio stops cleanly instead. */
+    {
+        uint32_t limit = sim_total_starts + 12u;               /* the "iPod" dies past this */
+        sim_total_limit = limit;
+        ring_stats_t b0; ring_stats(&b0);
+        ring_set_budget(b0.starts + 8u);                       /* we stop well before */
+        for (int f = 0; f < 60 * 60 * 3 && !sim_crashed; f++) { ring_tick(); sim_run(f % 3 == 2 ? 16 : 17); }
+        ring_stats_t b1; ring_stats(&b1);
+        printf("budget: stopped after %u starts (budget %u), device starts %u of %u, crashed %d\n",
+               b1.starts - b0.starts, b1.budget - b0.starts, sim_total_starts, limit, sim_crashed);
+        CHECK(!sim_crashed, "the budget kept the device under its limit");
+        CHECK(b1.starts == b1.budget, "used exactly the budget (%u of %u)", b1.starts, b1.budget);
+        CHECK(active_voices() == 0, "audio stopped once the budget ran out");
+        uint64_t h = heard; for (int f = 0; f < 600; f++) { ring_tick(); sim_run(16); }
+        CHECK(heard == h && !sim_crashed, "and stays stopped");
+    }
+
     printf(fails ? "%d FAILED\n" : "all ring tests passed\n", fails);
     return fails != 0;
 }
+#endif
