@@ -39,13 +39,21 @@ void ring_release(void);                         /* then: free the buffers (inte
 /* RetailOS allows only ~1,300 block starts per boot (see audio_ring.c). The ring
  * stops queueing, so the audio stops cleanly, once it has made `starts` of them. */
 void ring_set_budget(uint32_t starts);
+/* A control changed: take back what is rendered but not yet read by the mixer, so
+ * the next ring_tick() renders it again with the new state. Returns the frames
+ * taken back; the caller moves its source back by as many. */
+uint32_t ring_rewind(void);
+/* The caller is about to block for up to `ms` (a file write): render that far ahead
+ * now so the audio plays through it, and don't count the late tick that may follow
+ * towards a longer lead. */
+void ring_cover(uint32_t ms);
 
 typedef struct {
     uint32_t out_rate;      /* mixer rate read off the live voice (0 = unknown yet) */
     uint32_t block_frames;  /* current block length */
     uint32_t queued;        /* blocks handed to the OS, including the sounding one */
     uint32_t restarts;      /* times a voice had to be started */
-    uint32_t lead_ms;       /* how far ahead of the cursor we write (adapts upward) */
+    uint32_t lead_ms;       /* how far ahead of the cursor we write (grows with late ticks, decays back) */
     uint32_t late;          /* ticks that found the cursor past what was written */
     uint32_t skipped_ms;    /* total time handed to the skip callback */
     uint32_t voice_joins;   /* blocks the current voice has chained through */
@@ -57,5 +65,10 @@ typedef struct {
     uint32_t ctr_div;       /* voice counter = frames / this (0 = no counter, fallback) */
     uint32_t cal_ratio;     /* last measured block time / audio length, in % */
     uint32_t cal_steps;     /* measurements taken */
+    uint32_t rewinds;       /* ring_rewind() calls that took audio back */
+    uint32_t rewinds_fetch; /* of those, placed from the mixer's read position (else the estimate) */
+    uint32_t rewind_ms;     /* average audio taken back per rewind */
 } ring_stats_t;
 void ring_stats(ring_stats_t *s);
+void ring_debug_dump(void (*log)(const char *tag, uint32_t a, uint32_t b));
+void ring_fetch_report(void (*log)(const char *tag, uint32_t a, uint32_t b));

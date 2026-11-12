@@ -165,15 +165,22 @@ static void budget_init(void)
     hb_trace_log("NC_BOOT", prev_starts, (uint32_t)boot_s);
 }
 
+/* Writing the file blocks for a while (it syncs to flash). So: while the deck is
+ * silent it is saved within a few seconds of changing; while it plays, every 30 s,
+ * with enough audio rendered ahead first (ring_cover) that the write isn't heard
+ * and doesn't count as a late frame. */
+#define SAVE_COVER_MS 400u
 static void budget_save(void)
 {
     static uint32_t last; static int dir;
     uint32_t now = hb_time_uptime_ms();
-    if (now - last < 30000u) return;
+    int silent = app_deck_silent();
+    if (now - last < (silent ? 5000u : 30000u)) return;
     last = now;
     ring_stats_t r; ring_stats(&r);
     uint32_t total = prev_starts + r.starts;
     if (total == saved_starts) return;
+    ring_cover(silent ? 0 : SAVE_COVER_MS);
     if (!dir) { hb_fs_mkdir(STATE_DIR); dir = 1; }
     boot_state_t st = { STATE_MAGIC, boot_s, total };
     if (hb_fs_write(STATE_PATH, &st, sizeof st)) saved_starts = total;
@@ -188,8 +195,19 @@ int hal_audio_time_left_s(void)
     return (int)((uint64_t)left * r.block_frames / 44100u);
 }
 
+/* What the audio ring takes when it can have its longest blocks: two 6 s buffers
+ * (2 x 1.06 MB) and the 256 KB it insists on leaving the OS. */
+#define RING_WANTS (2u * 441u * 6000u / 10u * 4u + 256u * 1024u)
+
 static void start_audio_output(void)
 {
+    /* The track stream's buffers first, kept for the whole session. Before this,
+     * the ring took its 2 MB and each track load then looked for ~1.5 MB more in a
+     * heap that had been allocated and freed around for a while: when it wasn't
+     * there in one piece, the track didn't stream. Reserved here, the stream leaves
+     * the ring its full size when memory allows, and always gets its minimum. */
+    int reserved = mp3s_reserve(RING_WANTS);
+    hb_trace_log("NC_MEM", (uint32_t)reserved, hb_os_heap_largest());   /* stream buffers reserved / largest block left */
     ring_ok = acb && ring_init(ring_render, ring_skip, NULL) == 0;
     if (ring_ok) budget_init();
     hb_trace_log("NC_AUDIO", (uint32_t)ring_ok, hb_os_heap_largest());
@@ -217,6 +235,8 @@ static void audio_trace(void)
         hb_trace_log("NC_CAL", st.ctr_div | (st.cal_steps << 8), st.cal_ratio);
         /* NC_JOIN v1 = starts this session | earlier sessions this boot << 16, v2 = block frames */
         hb_trace_log("NC_JOIN", st.starts | (prev_starts << 16), st.block_frames);
+        /* NC_RWD v1 = rewinds | of which placed from the mixer's read position << 16, v2 = average ms taken back */
+        hb_trace_log("NC_RWD", (st.rewinds & 0xffffu) | (st.rewinds_fetch << 16), st.rewind_ms);
     }
     hb_trace_log("NC_HEAP", hb_os_heap_free(), hb_os_heap_largest());
     mp3s_stats_t ms;
@@ -240,18 +260,25 @@ static void audio_trace(void)
     st_gap_max = st_gap_n = st_app_max = st_ring_max = 0;
 }
 
+/* Render audio now. Twice a frame: straight after input (app_tick calls
+ * hal_audio_pump), so a press is rendered before the track is read and the screen
+ * drawn, and again after drawing, which halves the longest wait between renders. */
+static void pump(void)
+{
+    if (!ring_ok) return;
+    uint32_t t0 = hb_time_uptime_us();
+    ring_tick();
+    uint32_t dt = hb_time_uptime_us() - t0;
+    if (dt > st_ring_max) st_ring_max = dt;
+}
+void hal_audio_pump(void) { pump(); }
+unsigned hal_audio_rewind(void) { return ring_ok ? ring_rewind() : 0; }
+
 static void run_audio(void)
 {
     if (!acb) return;
     audio_trace();
-    if (ring_ok) budget_save();
-    if (ring_ok) {
-        uint32_t t0 = hb_time_uptime_us();
-        ring_tick();
-        uint32_t dt = hb_time_uptime_us() - t0;
-        if (dt > st_ring_max) st_ring_max = dt;
-        return;
-    }
+    if (ring_ok) { budget_save(); pump(); return; }
     /* fallback: silent clock */
     uint32_t now = hb_time_uptime_us();
     uint32_t dt = now - last_us;

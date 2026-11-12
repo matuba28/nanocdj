@@ -150,15 +150,18 @@ static void row_track(const uint8_t *row, const uint8_t *end, void *vctx)
     const uint8_t *so = row + 0x5e;
     char tmp[640];
     dstr(row + r16(so + 17 * 2), end, t->title, sizeof t->title);
+    char full[700];
     dstr(row + r16(so + 20 * 2), end, tmp, sizeof tmp);
-    join_path(t->path, sizeof t->path, c->root, tmp);
+    join_path(full, sizeof full, c->root, tmp);
+    t->path = lib_str(L, full);
     dstr(row + r16(so + 14 * 2), end, tmp, sizeof tmp);
     if (tmp[0]) {
         /* the database says /PIONEER/..., but Rekordbox on a Mac may write the folder as hidden .PIONEER */
         const char *rel = tmp;
         char fixed[660];
         if (c->dot_pioneer && !strncmp(tmp, "/PIONEER/", 9)) { snprintf(fixed, sizeof fixed, "/.%s", tmp + 1); rel = fixed; }
-        join_path(t->anlz, sizeof t->anlz, c->root, rel);
+        join_path(full, sizeof full, c->root, rel);
+        t->anlz = lib_str(L, full);
     }
     if (!t->title[0]) dstr(row + r16(so + 19 * 2), end, t->title, sizeof t->title);
 }

@@ -23,6 +23,8 @@
 #define LOW_AHEAD_S 4                 /* less than this read ahead: read harder */
 #define URGENT_US  12000u             /* per-frame read budget while catching up */
 #define CUE_LEAD   5                  /* cue buffer starts this many frames early (decoder priming) */
+#define READ_RETRIES 30               /* failed reads in a row before the file is given up on */
+#define IDX_MIN_S  720                /* the frame index holds at least this long a track from the start */
 #define NONE       0xffffffffu
 
 struct mp3s {
@@ -53,6 +55,8 @@ struct mp3s {
     int64_t  tags[NSLOTS];    /* audio frame number held by each slot, -1 = empty */
     int16_t  tmp[MINIMP3_MAX_SAMPLES_PER_FRAME];
 
+    int      pooled;          /* buffers are the shared ones (kept at close) */
+    uint32_t read_errs;       /* failed reads in a row */
     uint32_t bytes_read, reopens, misses, decodes, read_us;
     uint32_t us_per_kb;       /* measured read cost (EWMA) */
     uint32_t ahead_ms;        /* audio read ahead of the playhead, at the last service */
@@ -203,6 +207,14 @@ static int32_t timed_read(mp3s_t *s, void *buf, uint32_t n)
     return r;
 }
 
+/* A read returned nothing. 0 is the end of the file. An error may be passing
+ * (the OS file layer was busy): try again on the next calls, and only treat the
+ * file as ended, which cuts the track short there, once it keeps failing. */
+static void read_failed(mp3s_t *s, int32_t r)
+{
+    if (r == 0 || ++s->read_errs >= READ_RETRIES) s->file_eof = 1;
+}
+
 static void reopen(mp3s_t *s, uint32_t new_base)
 {
     if (s->fh) hal_file_close(s->fh);
@@ -216,29 +228,86 @@ static void reopen(mp3s_t *s, uint32_t new_base)
 
 int mp3s_open_error;
 
-mp3s_t *mp3s_open(const char *path, double est_seconds)
-{
-    mp3s_open_error = MP3S_ERR_MEMORY;
-    if (hal_mem_avail() < sizeof(mp3s_t) + WIN_MIN + CUE_MIN + NSLOTS * 1152u * 4u + 65536u) return NULL;
-    mp3s_t *s = (mp3s_t *)calloc(1, sizeof *s);
-    if (!s) return NULL;
-    snprintf(s->path, sizeof s->path, "%s", path);
-    s->fh = hal_file_open(path);
-    if (!s->fh) { free(s); mp3s_open_error = MP3S_ERR_FILE; return NULL; }
+/* The buffers a stream works in. One set is kept between tracks (see mp3stream.h). */
+typedef struct {
+    mp3s_t  *s;               /* the stream struct itself (~13 KB with the decoder state) */
+    int16_t *slots;
+    uint32_t *idx; uint32_t idx_cap;
+    uint8_t *win;  uint32_t cap;
+    uint8_t *cb;   uint32_t ccap;
+} bufs_t;
+static bufs_t pool;
+static int pool_have, pool_busy;
 
-    s->slots = (int16_t *)malloc(NSLOTS * 1152u * 4u);
-    s->idx_cap = (uint32_t)((est_seconds > 0 ? est_seconds + 60 : 600) * 48000 / 1152) + 64;
-    s->idx = (uint32_t *)malloc((size_t)s->idx_cap * 4);
+static void bufs_free(bufs_t *b)
+{
+    free(b->win); free(b->cb); free(b->slots); free(b->idx); free(b->s);
+    memset(b, 0, sizeof *b);
+}
+
+/* `leave` = memory to leave free for later allocations (0: take 80% of what's free) */
+static int bufs_alloc(bufs_t *b, size_t leave, double est_seconds)
+{
+    memset(b, 0, sizeof *b);
+    if (hal_mem_avail() < sizeof(mp3s_t) + WIN_MIN + CUE_MIN + NSLOTS * 1152u * 4u + 65536u) return 0;
+    b->s = (mp3s_t *)malloc(sizeof(mp3s_t));
+    b->slots = (int16_t *)malloc(NSLOTS * 1152u * 4u);
+    double secs = est_seconds + 60 > IDX_MIN_S ? est_seconds + 60 : IDX_MIN_S;
+    b->idx_cap = (uint32_t)(secs * 48000 / 1152) + 64;
+    b->idx = (uint32_t *)malloc((size_t)b->idx_cap * 4);
     /* split what's free between the window and the cue buffer (separate blocks) */
     size_t avail = hal_mem_avail();
     size_t budget = avail / 10 * 8;
-    uint32_t ccap = (uint32_t)(budget * 4 / 10 > CUE_BYTES ? CUE_BYTES : budget * 4 / 10);
-    uint32_t cap = (uint32_t)(budget - ccap > WIN_MAX ? WIN_MAX : budget - ccap);
+    if (leave) {
+        /* something else needs `leave` after us: take the rest, but never less than
+         * the smallest window and cue buffer (that something makes do with less) */
+        size_t rest = avail > leave ? avail - leave : 0;
+        if (rest < budget) budget = rest;
+        if (budget < WIN_MIN + CUE_MIN) budget = avail / 10 * 8 < WIN_MIN + CUE_MIN ? avail / 10 * 8 : WIN_MIN + CUE_MIN;
+    }
+    size_t ccap = budget * 4 / 10 > CUE_BYTES ? CUE_BYTES : budget * 4 / 10;
+    if (budget - ccap < WIN_MIN) ccap = budget > WIN_MIN ? budget - WIN_MIN : 0;   /* the window comes first */
+    size_t cap = budget - ccap > WIN_MAX ? WIN_MAX : budget - ccap;
     if (ccap < CUE_MIN) ccap = 0;
-    if (s->slots && s->idx && cap >= WIN_MIN) { s->win = (uint8_t *)malloc(cap); s->cap = cap; }
-    if (s->win && ccap) { s->cb = (uint8_t *)malloc(ccap); s->ccap = s->cb ? ccap : 0; }
+    if (b->s && b->slots && b->idx && cap >= WIN_MIN) { b->win = (uint8_t *)malloc(cap); b->cap = (uint32_t)cap; }
+    if (b->win && ccap) { b->cb = (uint8_t *)malloc(ccap); b->ccap = b->cb ? (uint32_t)ccap : 0; }
+    if (!b->s || !b->slots || !b->idx || !b->win) { bufs_free(b); return 0; }
+    return 1;
+}
+
+int mp3s_reserve(size_t leave)
+{
+    if (!pool_have) pool_have = bufs_alloc(&pool, leave, 0);
+    return pool_have;
+}
+
+void mp3s_release(void)
+{
+    if (!pool_have || pool_busy) return;
+    bufs_free(&pool);
+    pool_have = 0;
+}
+
+mp3s_t *mp3s_open(const char *path, double est_seconds)
+{
+    mp3s_open_error = MP3S_ERR_MEMORY;
+    /* the kept buffers, or (a second stream open at once: tests, tools) a set of its own */
+    bufs_t own, *b = &pool;
+    int pooled = !pool_busy;
+    if (pooled) { if (!pool_have) pool_have = bufs_alloc(&pool, 0, est_seconds); if (!pool_have) return NULL; }
+    else { if (!bufs_alloc(&own, 0, est_seconds)) return NULL; b = &own; }
+    void *fh = hal_file_open(path);
+    if (!fh) { if (!pooled) bufs_free(&own); mp3s_open_error = MP3S_ERR_FILE; return NULL; }
+
+    mp3s_t *s = b->s;
+    memset(s, 0, sizeof *s);
+    snprintf(s->path, sizeof s->path, "%s", path);
+    s->fh = fh;
+    s->pooled = pooled;
+    if (pooled) pool_busy = 1;
+    s->slots = b->slots; s->idx = b->idx; s->idx_cap = b->idx_cap;
+    s->win = b->win; s->cap = b->cap; s->cb = b->cb; s->ccap = b->ccap;
     s->us_per_kb = 1500;                               /* ~0.7 MB/s until measured */
-    if (!s->slots || !s->idx || !s->win) { mp3s_close(s); return NULL; }
     mp3s_open_error = 0;
 
     for (int i = 0; i < NSLOTS; i++) s->tags[i] = -1;
@@ -252,8 +321,14 @@ void mp3s_close(mp3s_t *s)
 {
     if (!s) return;
     if (s->fh) hal_file_close(s->fh);
-    free(s->win); free(s->cb); free(s->slots); free(s->idx);
-    free(s);
+    s->fh = NULL;
+    if (s->pooled) {                                   /* keep the buffers for the next track */
+        pool.idx = s->idx; pool.idx_cap = s->idx_cap;  /* (the index may have grown) */
+        pool_busy = 0;
+        return;
+    }
+    bufs_t b = { s, s->slots, s->idx, s->idx_cap, s->win, s->cap, s->cb, s->ccap };
+    bufs_free(&b);
 }
 
 int mp3s_hz(const mp3s_t *s) { return s->have_fmt ? s->hz : 0; }
@@ -315,7 +390,8 @@ void mp3s_service(mp3s_t *s, int64_t play, int64_t cue, uint32_t budget_us)
             uint32_t n = s->base - s->fpos;
             if (n > fit) n = fit;
             int32_t r = timed_read(s, skipbuf, n);
-            if (r <= 0) { s->file_eof = 1; break; }
+            if (r <= 0) { read_failed(s, r); break; }
+            s->read_errs = 0;
             s->fpos += (uint32_t)r; s->bytes_read += (uint32_t)r;
             continue;
         }
@@ -324,6 +400,9 @@ void mp3s_service(mp3s_t *s, int64_t play, int64_t cue, uint32_t budget_us)
             if (play_off != NONE) keep = play_off > s->base + back ? play_off - back : s->base;
             else keep = s->base + s->len - back;                            /* playhead not indexed yet */
             if (keep > s->scan) keep = s->scan;                             /* never drop unparsed bytes */
+#ifdef MP3S_DEBUG
+            if (keep < s->base) fprintf(stderr, "keep<base: keep %u base %u len %u scan %u play_off %u fpos %u ended %d nidx %u\n", keep, s->base, s->len, s->scan, play_off, s->fpos, s->ended, s->nidx);
+#endif
             if (keep < s->base) keep = s->base;
             if (keep > s->base + s->len) keep = s->base + s->len;
             uint32_t shift = keep - s->base;
@@ -334,7 +413,8 @@ void mp3s_service(mp3s_t *s, int64_t play, int64_t cue, uint32_t budget_us)
         uint32_t n = s->cap - s->len;
         if (n > fit) n = fit;
         int32_t r = timed_read(s, s->win + s->len, n);
-        if (r <= 0) { s->file_eof = 1; break; }
+        if (r <= 0) { read_failed(s, r); break; }
+        s->read_errs = 0;
         s->len += (uint32_t)r; s->fpos += (uint32_t)r; s->bytes_read += (uint32_t)r;
         parse(s);
         if (s->cb && s->have_fmt && s->cue_frame >= 0 && s->cbase == NONE && s->cue_frame < (int64_t)s->nidx)
@@ -403,7 +483,7 @@ const int16_t *mp3s_samples(mp3s_t *s, int64_t j, int *n)
 
 void mp3s_stats(const mp3s_t *s, mp3s_stats_t *st)
 {
-    st->window_bytes = s->len; st->window_cap = s->cap; st->cue_bytes = s->clen;
+    st->window_bytes = s->len; st->window_cap = s->cap; st->cue_bytes = s->clen; st->cue_cap = s->ccap;
     st->frames_indexed = s->nidx; st->bytes_read = s->bytes_read; st->reopens = s->reopens;
     st->misses = s->misses; st->decodes = s->decodes; st->read_us = s->read_us;
     st->eof = s->ended; st->hz = s->hz; st->bitrate_kbps = s->bitrate;

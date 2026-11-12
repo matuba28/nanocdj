@@ -23,6 +23,7 @@
  * caller holds hal_audio_lock around mp3s_service on platforms with an audio thread. */
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 
 typedef struct mp3s mp3s_t;
 
@@ -32,6 +33,16 @@ mp3s_t *mp3s_open(const char *path, double est_seconds);
 enum { MP3S_ERR_FILE = 2, MP3S_ERR_MEMORY = 3 };
 extern int mp3s_open_error;              /* why the last mp3s_open returned NULL */
 void    mp3s_close(mp3s_t *s);
+
+/* The stream's buffers (compressed window, cue buffer, decoded-frame cache, frame
+ * index) are allocated once and kept between tracks: allocating ~2 MB afresh for
+ * every load fragments a heap of a few MB until one load no longer fits. The first
+ * mp3s_open allocates them if mp3s_reserve hasn't. Call mp3s_reserve early (before
+ * other big allocations) to make sure of them: `leave` is how much memory to leave
+ * for what comes after (0 = take the usual share). Returns 1 if the buffers exist.
+ * mp3s_release frees them (not while a stream is open). */
+int  mp3s_reserve(size_t leave);
+void mp3s_release(void);
 
 /* Read/parse/slide toward the source sample `play` (and keep the cue buffer at
  * source sample `cue`, -1 for none), spending at most ~budget_us. */
@@ -47,7 +58,7 @@ int     mp3s_searching(const mp3s_t *s); /* still reading toward the first audio
 int64_t mp3s_length(const mp3s_t *s);    /* exact length in source samples, -1 until the end is reached */
 
 typedef struct {
-    uint32_t window_bytes, window_cap, cue_bytes;
+    uint32_t window_bytes, window_cap, cue_bytes, cue_cap;
     uint32_t frames_indexed, bytes_read, reopens, misses, decodes;
     uint32_t read_us;                    /* time spent reading in the last service call */
     int      eof, hz, bitrate_kbps;

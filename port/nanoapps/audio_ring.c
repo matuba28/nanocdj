@@ -83,6 +83,22 @@ typedef void  (*sfx_player_play_t)(void *player, void *desc, void *cb, void *cbd
 #define LEAD_MAX_MS 200u
 #define JITTER_MS   100u         /* tick gaps up to this are cadence, longer ones are stalls */
 #define NOSTART_MS  150u         /* a started voice that never shows up: give up on it */
+/* ring_rewind(): how close to the mixer the write point is taken back. With the
+ * mixer's own read position (voice+0x50) only a little slack is needed: it reads in
+ * 1024-frame passes ~23 ms apart, and the re-render follows within a millisecond or
+ * two. Without it, the cursor estimate can be a pass behind the mixer and a tick
+ * out, so stay further ahead. */
+#define REWIND_FETCH 256u        /* frames past the mixer's read position */
+#define REWIND_EST   1536u       /* frames past the estimated cursor */
+#define FETCH_SANE   2048u       /* a read position further than this from the estimate isn't believed */
+/* The lead grows when ticks come late, and comes back down once they have been
+ * punctual for a while: after DECAY_FIRST_MS without a late tick and with every
+ * gap well under the one that last made it grow, it drops DECAY_STEP_MS, and again
+ * every DECAY_NEXT_MS. A hitch that recurs more often than that keeps its lead. */
+#define DECAY_FIRST_MS 60000u
+#define DECAY_NEXT_MS  30000u
+#define DECAY_STEP_MS  20u
+#define DECAY_ROOM_MS  15u
 
 #define U32(d, off) (*(volatile uint32_t *)((d) + (off)))
 #define U8(d, off)  (*(volatile uint8_t *)((d) + (off)))
@@ -124,12 +140,22 @@ static uint32_t g_t_out;          /* us at which the cursor reaches g_w (written
 static uint32_t g_lead_ms = LEAD_MS;
 static uint8_t  g_quiet_ticks;
 static uint32_t g_restarts, g_late, g_skipped_frames;
+static uint8_t  g_rewound, g_forgive;      /* this tick follows a rewind / a stall the caller announced */
+static uint32_t g_cover_ms;                /* ring_cover(): write this far ahead on the tick in progress */
+static uint32_t g_rewinds, g_rw_fetch, g_rw_frames;
+static uint32_t g_win_t0, g_win_ms = DECAY_FIRST_MS, g_win_gap, g_bump_gap;   /* lead decay (gaps in us) */
 static uint32_t g_voice_joins, g_joins_total;   /* chained handovers on the current voice / ever */
 /* voice handover: 0 none, 1 armed (new voice's first block queued, not started),
  * 2 started (old voice still finishing its last block) */
 static int      g_ho;
 static uint8_t  g_ho_slot, g_ho_tail, g_ho_faded;
 static uint32_t g_ho_t, g_handovers;
+/* fetch probe: voice+0x50 counts down the frames the mixer has still to pull from
+ * the current buffer (in 1024-frame passes), so start + frames - it = how far the
+ * mixer has actually read. Diagnostics only for now. */
+#define V_REMAIN 0x50u
+static uint32_t g_fetch, g_fetch_ok, g_fetch_odd, g_fetch_odd_delta, g_fetch_behind, g_fetch_samples;
+static int32_t  g_fetch_min_lead = 0x7fffffff, g_fetch_max_est;
 
 /* The voice's length counter (voice+0x48, set from descriptor+0x34) does not
  * count output frames one-for-one on the device: with it set to a block's frame
@@ -452,6 +478,21 @@ static int follow(uint32_t now)
     }
     slot_t *h = &g_slot[g_q[0]];
     h->seen = 1;
+    {
+        uint32_t v = U32(h->desc, D_VOICE);
+        if (v && !(v & 3u)) {
+            uint32_t rem = *(volatile uint32_t *)((uint8_t *)U32_TO_PTR(v) + V_REMAIN);
+            if (rem <= h->frames) {
+                uint32_t f = h->start + h->frames - rem;
+                if (g_fetch_ok && f != g_fetch) {
+                    uint32_t d = f - g_fetch;
+                    if (f < g_fetch || d % 1024u) { g_fetch_odd++; g_fetch_odd_delta = d; }
+                }
+                if (g_fetch_ok && f < g_fetch) { /* went backwards */ }
+                g_fetch = f; g_fetch_ok = 1; g_fetch_samples++;
+            }
+        }
+    }
     /* still sounding: it can't have started longer ago than it lasts */
     uint32_t dur = frames_to_us(h->frames);
     if (since(now, g_head_t) > (int32_t)dur) g_head_t = now - dur;
@@ -466,7 +507,7 @@ void ring_tick(void)
 
     if (gap > (int32_t)(JITTER_MS * 1000u)) { g_cal_frames = 0; g_cal_t0 = 0; }
     int f = g_running ? follow(now) : 0;
-    if (f == 2) { g_last_tick = now; return; }   /* decide next tick; keep g_t_out as it was */
+    if (f == 2) { g_last_tick = now; return; }   /* decide next tick; keep g_t_out as it was (and the rewind / forgive flags) */
     if (g_running && !f) {
         /* the voice ran out (frames stopped: screen locked, app in background).
          * Everything queued has played or never will. */
@@ -488,19 +529,37 @@ void ring_tick(void)
     if (in > h->frames) in = h->frames;
     uint32_t cursor = h->start + in;
 
-    if (cursor > g_w) {
+    /* (Straight after a rewind the write point was placed from the mixer's own read
+     * position, which the estimate may be a little ahead of: nothing was missed.) */
+    if (cursor > g_w && !g_rewound) {
         /* it overtook what we'd written: it played zeros. Move the source on by the
          * same amount so it stays on the wall clock, and if this was ordinary tick
          * jitter rather than a stall, write further ahead from now on. */
         g_late++;
-        if (gap <= (int32_t)(JITTER_MS * 1000u) && g_lead_ms < LEAD_MAX_MS) g_lead_ms += 10u;
+        if (!g_forgive && gap <= (int32_t)(JITTER_MS * 1000u)) {
+            if (g_lead_ms < LEAD_MAX_MS) g_lead_ms += 10u;
+            if ((uint32_t)gap > g_bump_gap) g_bump_gap = (uint32_t)gap;
+            g_win_t0 = now; g_win_ms = DECAY_FIRST_MS; g_win_gap = 0;
+        }
         skip(cursor - g_w);
         g_w = cursor;
     }
+    /* bring the lead back down once ticks have been punctual for a while */
+    if (!g_forgive && gap > 0 && gap <= (int32_t)(JITTER_MS * 1000u) && (uint32_t)gap > g_win_gap) g_win_gap = (uint32_t)gap;
+    if (g_lead_ms <= LEAD_MS) { g_bump_gap = 0; g_win_t0 = now; g_win_gap = 0; }
+    else if (since(now, g_win_t0) > (int32_t)(g_win_ms * 1000u)) {
+        if (g_win_gap + DECAY_ROOM_MS * 1000u < g_bump_gap || !g_bump_gap) {
+            g_lead_ms = g_lead_ms > LEAD_MS + DECAY_STEP_MS ? g_lead_ms - DECAY_STEP_MS : LEAD_MS;
+            g_win_ms = DECAY_NEXT_MS;
+        }
+        g_win_t0 = now; g_win_gap = 0;
+    }
+    g_rewound = 0; g_forgive = 0;
 
-    uint32_t target = cursor + us_to_frames(g_lead_ms * 1000u);
+    uint32_t lead = us_to_frames((g_cover_ms > g_lead_ms ? g_cover_ms : g_lead_ms) * 1000u);
+    uint32_t target = cursor + lead;
     /* keep a block chained past the write point so the voice always has a successor */
-    while (g_end <= target + us_to_frames(g_lead_ms * 1000u))
+    while (g_end <= target + lead)
         if (!queue_block(now)) break;
     if (target > g_end) target = g_end;
     render_to(target);
@@ -509,8 +568,69 @@ void ring_tick(void)
 
     g_t_out = now + frames_to_us(g_w - cursor);
     g_last_tick = now;
+    if (g_fetch_ok) {
+        int32_t lead = (int32_t)(g_w - g_fetch);
+        if (lead < g_fetch_min_lead) g_fetch_min_lead = lead;
+        if (lead <= 0) g_fetch_behind++;
+        int32_t est = (int32_t)(cursor - g_fetch);
+        if (est > g_fetch_max_est) g_fetch_max_est = est;
+    }
 }
 
+/* Where the mixer has read up to in the sounding block, read off the voice now. */
+static int fetch_now(uint32_t *f)
+{
+    if (!g_running || !g_qn) return 0;
+    slot_t *h = &g_slot[g_q[0]];
+    if (!playing(h)) return 0;
+    uint32_t v = U32(h->desc, D_VOICE);
+    if (!v || (v & 3u)) return 0;
+    uint32_t rem = *(volatile uint32_t *)((uint8_t *)U32_TO_PTR(v) + V_REMAIN);
+    if (rem > h->frames) return 0;
+    *f = h->start + h->frames - rem;
+    return 1;
+}
+
+/* A control changed (cue, play, a loop jump): take back the audio that has been
+ * rendered but not yet read by the mixer, so the next ring_tick() renders it again
+ * with the new state. Without this a change is only heard a whole lead later.
+ * Returns the frames taken back: the caller moves its source back by as many. */
+uint32_t ring_rewind(void)
+{
+    if (!g_ready || g_stopping || !g_running || !g_qn || g_ho) return 0;
+    uint32_t now = OS_NOW_US();
+    int32_t el = since(now, g_head_t);
+    uint32_t cursor = g_slot[g_q[0]].start + us_to_frames((uint32_t)(el > 0 ? el : 0));
+    uint32_t safe = cursor + REWIND_EST, f;
+    if (fetch_now(&f) && f + FETCH_SANE >= cursor && f <= cursor + FETCH_SANE) { safe = f + REWIND_FETCH; g_rw_fetch++; }
+    if (safe >= g_w) return 0;
+    uint32_t n = g_w - safe;
+    g_w = safe;
+    g_rewound = 1; g_rewinds++; g_rw_frames += n;
+    return n;
+}
+
+/* The caller is about to block for up to `ms` (a file write): render that far
+ * ahead now, so the voice has audio to play through it, and don't let a late tick
+ * straight after it make the lead grow (it says nothing about the usual cadence).
+ * The extra audio is simply played down over the following ticks. */
+void ring_cover(uint32_t ms)
+{
+    g_cover_ms = ms;
+    ring_tick();
+    g_cover_ms = 0;
+    g_forgive = 1;
+}
+
+/* NC_FETCH: v1 = odd fetch steps | written-behind-fetch ticks << 16, v2 = last odd step
+ * NC_FLEAD: v1 = min frames written ahead of the mixer, v2 = max (estimate - fetch) frames */
+void ring_fetch_report(void (*log)(const char *tag, uint32_t a, uint32_t b))
+{
+    log("NC_FETCH", (g_fetch_odd & 0xffffu) | (g_fetch_behind << 16), g_fetch_odd_delta);
+    log("NC_FLEAD", (uint32_t)g_fetch_min_lead, (uint32_t)g_fetch_max_est);
+    log("NC_FSAMP", g_fetch_samples, g_fetch);
+    g_fetch_min_lead = 0x7fffffff; g_fetch_max_est = -0x7fffffff;
+}
 
 /* Resident hook (its own task, no FPU): stop feeding, cut the chain, silence what
  * is queued, and report safe only once no voice still holds one of our descriptors. */
@@ -556,5 +676,27 @@ void ring_stats(ring_stats_t *s)
     s->duration_ok = !g_duration_bad && duration_ms(g_block) != 0;
     s->ctr_div = g_duration_bad ? 0 : g_ctr_div;
     s->cal_ratio = g_cal_ratio; s->cal_steps = g_cal_steps;
+    s->rewinds = g_rewinds; s->rewinds_fetch = g_rw_fetch;
+    s->rewind_ms = g_rewinds ? (uint32_t)(((uint64_t)g_rw_frames * 10u) / 441u) / g_rewinds : 0;
 }
 
+/* Diagnostics: log where everything is, then 64 words of the live voice, so the
+ * voice's real read position can be found by comparing dumps from two ticks. */
+void ring_debug_dump(void (*log)(const char *tag, uint32_t a, uint32_t b))
+{
+    if (!g_running || !g_qn) { log("NC_DNONE", g_running, g_qn); return; }
+    uint32_t now = OS_NOW_US();
+    slot_t *h = &g_slot[g_q[0]];
+    uint32_t in = us_to_frames((uint32_t)(since(now, g_head_t) > 0 ? since(now, g_head_t) : 0));
+    log("NC_DNOW", now, g_head_t);
+    log("NC_DCUR", h->start + in, g_w);
+    for (uint32_t i = 0; i < g_qn; i++) {
+        slot_t *s = &g_slot[g_q[i]];
+        log("NC_DSLOT", PTR_TO_U32(s->pcm), s->start | ((uint32_t)playing(s) << 31));
+    }
+    uint32_t v = U32(h->desc, D_VOICE);
+    log("NC_DVOICE", v, PTR_TO_U32(h->desc));
+    if (!v || (v & 3u)) return;
+    for (uint32_t off = 0; off < 0x100u; off += 4u)
+        log("NC_V", off, *(volatile uint32_t *)((uint8_t *)U32_TO_PTR(v) + off));
+}

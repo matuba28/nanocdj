@@ -7,6 +7,7 @@
 #include "mp3stream.h"
 
 typedef enum { JOG_BEND, JOG_VINYL } jog_mode;
+#define DECK_HIST 64   /* render calls remembered (a power of two): 370 ms at 256 frames each */
 
 typedef struct {
     hal_pcm pcm;           /* whole decoded track (non-MP3, where a decoder exists), or just .frames when streaming */
@@ -40,6 +41,11 @@ typedef struct {
 
     double last_rate;      /* for display */
 
+    /* the last render calls, newest last, so rendered-but-unheard audio can be taken
+     * back (deck_unrender) when a control changes */
+    struct { double pos; float rate; uint16_t frames; uint8_t stopped; } hist[DECK_HIST];
+    unsigned hist_w, hist_n;
+
     /* beat clicks: the test signal played when there is no decoded audio */
     int click_beat, click_sync;
     double click_end_pos;
@@ -59,6 +65,10 @@ void deck_render(deck_t *d, float *out, int frames);                     /* audi
 void deck_service(deck_t *d);
 /* move on by `frames` of output time without rendering (time the audio output missed) */
 void deck_skip(deck_t *d, double frames);
+/* Undo the last `frames` of output rendered: the platform took them back before
+ * they were heard (hal_audio_rewind) and will render them again. Call it before
+ * applying the control change, so the change takes effect from what is audible now. */
+void deck_unrender(deck_t *d, unsigned frames);
 
 void deck_play_pressed(deck_t *d);
 void deck_cue_down(deck_t *d);

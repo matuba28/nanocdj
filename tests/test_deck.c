@@ -1,5 +1,6 @@
 /* Engine tests with a synthetic track: 120 BPM grid, 60 s of audio. Run: make test */
 #include "../src/deck.h"
+#include "../src/library.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +34,32 @@ static void setup(deck_t *d)
     d->loaded = 1;
     d->cue = AUDIO_RATE * 0.1;
     d->pos = d->cue;
+}
+
+/* ---- synthetic Rekordbox analysis files, for the streaming reader ---- */
+static void put32(FILE *f, uint32_t v) { fputc(v >> 24, f); fputc(v >> 16, f); fputc(v >> 8, f); fputc(v, f); }
+static void put16(FILE *f, uint32_t v) { fputc(v >> 8, f); fputc(v, f); }
+static uint32_t wv(uint32_t i) { return ((i * 7u) % 31u) << 2 | (i % 7u) << 13; }   /* PWV5 entry: height (i*7)%31 */
+
+/* EXT: PWV3 + PWV5 with n entries, a PCO2 cue list; DAT: PQTZ with nb beats, PWAV */
+static void write_anlz(const char *dat, const char *ext, uint32_t n, uint32_t nb)
+{
+    FILE *f = fopen(ext, "wb");
+    fwrite("PMAI", 1, 4, f); put32(f, 28); put32(f, 0); for (int i = 0; i < 16; i++) fputc(0, f);
+    fwrite("PWV3", 1, 4, f); put32(f, 24); put32(f, 24 + n); put32(f, 1); put32(f, n); put32(f, 0x960000);
+    for (uint32_t i = 0; i < n; i++) fputc((int)((i * 7u) % 31u), f);
+    fwrite("PWV5", 1, 4, f); put32(f, 24); put32(f, 24 + n * 2); put32(f, 2); put32(f, n); put32(f, 0x960305);
+    for (uint32_t i = 0; i < n; i++) put16(f, wv(i));
+    fwrite("PCO2", 1, 4, f); put32(f, 20); put32(f, 20 + 0x1c); put32(f, 0); put16(f, 1); put16(f, 0);
+    fwrite("PCP2", 1, 4, f); put32(f, 0x10); put32(f, 0x1c); put32(f, 1); fputc(1, f); fputc(0, f); put16(f, 0); put32(f, 61234); put32(f, 0xffffffff);
+    fclose(f);
+    f = fopen(dat, "wb");
+    fwrite("PMAI", 1, 4, f); put32(f, 28); put32(f, 0); for (int i = 0; i < 16; i++) fputc(0, f);
+    fwrite("PQTZ", 1, 4, f); put32(f, 24); put32(f, 24 + nb * 8); put32(f, 0); put32(f, 0x80000); put32(f, nb);
+    for (uint32_t i = 0; i < nb; i++) { put16(f, i % 4 + 1); put16(f, 12400); put32(f, 100 + i * 484); }
+    fwrite("PWAV", 1, 4, f); put32(f, 20); put32(f, 20 + 400); put32(f, 400); put32(f, 0x10000);
+    for (int i = 0; i < 400; i++) fputc(i % 32, f);
+    fclose(f);
 }
 
 int main(void)
@@ -202,6 +229,101 @@ int main(void)
         CHECK(c.click_env == 0, "skip silences a ringing click");
         deck_render(&c, buf, 4410);
         CHECK(c.click_sync == 1, "resynced to the grid");
+    }
+
+    /* deck_unrender: taking back rendered audio puts the deck where it was */
+    {
+        float buf[2 * 256];
+        deck_t u; setup(&u); deck_play_pressed(&u);
+        double p0 = u.pos;
+        for (int i = 0; i < 10; i++) deck_render(&u, buf, 256);
+        CHECK(fabs(u.pos - (p0 + 2560)) < 1e-6, "rendered 2560");
+        deck_unrender(&u, 700);                                   /* two whole calls and part of a third */
+        CHECK(fabs(u.pos - (p0 + 1860)) < 1e-6, "unrender 700 of 2560: %.1f", u.pos - p0);
+        deck_render(&u, buf, 256); deck_unrender(&u, 256);
+        CHECK(fabs(u.pos - (p0 + 1860)) < 1e-6, "render + unrender is a no-op");
+        /* a pitch change part-way: each call is undone at the rate it was rendered at */
+        deck_t v; setup(&v); deck_play_pressed(&v); p0 = v.pos;
+        deck_render(&v, buf, 256); deck_render(&v, buf, 256);
+        deck_set_pitch(&v, 0.10);
+        deck_render(&v, buf, 256); deck_render(&v, buf, 256);
+        deck_unrender(&v, 600);                                   /* the two fast calls and 88 frames at 1x */
+        CHECK(fabs(v.pos - (p0 + 424)) < 1e-3, "across a pitch change: %.3f", v.pos - p0);
+        /* over a loop wrap */
+        deck_t w; setup(&w); deck_play_pressed(&w);
+        w.loop_in = AUDIO_RATE * 10; w.loop_out = w.loop_in + 1000; w.loop_in_set = w.loop_active = 1; w.pos = w.loop_in + 900;
+        deck_render(&w, buf, 256);
+        CHECK(fabs(w.pos - (w.loop_in + 156)) < 1e-6, "wrapped");
+        deck_unrender(&w, 100);                                   /* keep 156 frames: 900 + 156 wraps to 56 */
+        CHECK(fabs(w.pos - (w.loop_in + 56)) < 1e-6, "partial call across the loop end: %.1f", w.pos - w.loop_in);
+        deck_unrender(&w, 156);
+        CHECK(fabs(w.pos - (w.loop_in + 900)) < 1e-6, "back before the wrap: %.1f", w.pos - w.loop_in);
+        /* ran into the end of the track inside the audio taken back: playing again */
+        deck_t e; setup(&e); deck_play_pressed(&e); e.pos = (double)e.pcm.frames - 100;
+        deck_render(&e, buf, 256);
+        CHECK(!e.playing, "stopped at the end");
+        deck_unrender(&e, 256);
+        CHECK(e.playing && fabs(e.pos - ((double)e.pcm.frames - 100)) < 1e-6, "end of track undone");
+        deck_render(&e, buf, 256); deck_render(&e, buf, 256);
+        deck_unrender(&e, 256);                                   /* only the silent call after the stop */
+        CHECK(!e.playing && e.pos == e.pcm.frames - 1, "stays stopped when only silence is taken back");
+        /* paused: nothing moves; more than is remembered: stops at the oldest */
+        deck_t q; setup(&q); p0 = q.pos;
+        deck_render(&q, buf, 256); deck_unrender(&q, 256);
+        CHECK(q.pos == p0, "paused unrender");
+        deck_play_pressed(&q);
+        for (int i = 0; i < DECK_HIST + 20; i++) deck_render(&q, buf, 256);
+        deck_unrender(&q, 256 * (DECK_HIST + 50));
+        CHECK(fabs(q.pos - (p0 + 20 * 256)) < 1e-6, "unrender is bounded by the history: %.1f", q.pos - p0);
+        /* the cue press itself: back to the cue from the audible position */
+        deck_t c; setup(&c); deck_play_pressed(&c);
+        for (int i = 0; i < 20; i++) deck_render(&c, buf, 256);
+        deck_unrender(&c, 3000); deck_cue_down(&c);
+        CHECK(!c.playing && c.pos == c.cue, "cue after unrender");
+        free(u.pcm.data); free(v.pcm.data); free(w.pcm.data); free(e.pcm.data); free(q.pcm.data); free(c.pcm.data);
+    }
+
+    /* the library's string store */
+    {
+        library L; memset(&L, 0, sizeof L);
+        lib_track *t = lib_add_track(&L);
+        CHECK(t->path[0] == 0 && t->anlz[0] == 0, "paths start empty");
+        const char *a = lib_str(&L, "/a/b.mp3"), *b = lib_str(&L, "/c/d.mp3");
+        char big[40000]; memset(big, 'x', sizeof big - 1); big[sizeof big - 1] = 0;
+        const char *c2 = lib_str(&L, big), *d2 = lib_str(&L, "after");
+        CHECK(!strcmp(a, "/a/b.mp3") && !strcmp(b, "/c/d.mp3") && b == a + 9, "strings packed");
+        CHECK(strlen(c2) == sizeof big - 1 && !strcmp(d2, "after") && !strcmp(a, "/a/b.mp3"), "long string, earlier ones intact");
+        CHECK(lib_str(&L, "")[0] == 0, "empty string");
+        CHECK(sizeof(lib_track) <= 264, "a track is small: %zu bytes", sizeof(lib_track));
+    }
+
+    /* streamed analysis reader: an hour-long track's waveform is thinned to fit, the
+     * mono copy dropped once the color one is there, beats/cues/preview intact */
+    {
+        const char *dat = "tests/build/anlz_test.DAT", *ext = "tests/build/anlz_test.EXT";
+        uint32_t n = 150u * 3600u, nb = 7440;                          /* 1 hour at 150/s, 124 BPM */
+        write_anlz(dat, ext, n, nb);
+        anlz_t a;
+        CHECK(anlz_load(&a, dat) == 0, "loads");
+        CHECK(a.wave_div == 3 && a.ncwave == (int)((n + 2) / 3), "1 h thinned 3:1 (div %d, %d entries)", a.wave_div, a.ncwave);
+        CHECK(a.nwave == 0 && a.wave == NULL, "mono waveform dropped when color exists");
+        int bad = 0;
+        for (uint32_t g = 0; g < 1000 && g < (uint32_t)a.ncwave; g++) {           /* tallest of each 3 kept */
+            uint32_t best = 0, bh = 0;
+            for (uint32_t k = 0; k < 3; k++) { uint32_t v = wv(g * 3 + k), h = (v >> 2) & 31; if (k == 0 || h > bh) { best = v; bh = h; } }
+            if (a.cwave[g] != best) bad++;
+        }
+        CHECK(bad == 0, "thinning keeps the tallest entry (%d wrong)", bad);
+        CHECK(a.nbeats == (int)nb && a.beats[1].time_ms == 584 && a.beats[1].beat == 2 && a.beats[0].bpm100 == 12400, "beats");
+        CHECK(a.ncues == 1 && a.cues[0].time_ms == 61234 && a.cues[0].hot == 1, "cue from PCO2");
+        CHECK(a.has_preview && a.preview[33] == 1, "preview");
+        CHECK(anlz_wave_rate(&a) == 50.0, "wave rate %f", anlz_wave_rate(&a));
+        anlz_free(&a);
+        write_anlz(dat, ext, 150u * 600u, 100);                             /* 10 min: kept as is */
+        CHECK(anlz_load(&a, dat) == 0 && a.wave_div == 1 && a.ncwave == 90000, "short track not thinned");
+        anlz_free(&a);
+        CHECK(anlz_load(&a, "tests/build/missing.DAT") != 0 && a.nbeats == 0, "missing files: no analysis, no crash");
+        anlz_free(&a);
     }
 
     printf(fails ? "%d FAILED\n" : "all deck tests passed\n", fails);

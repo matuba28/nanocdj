@@ -7,7 +7,25 @@ lib_track *lib_add_track(library *L)
     if ((L->nt & 255) == 0) L->t = realloc(L->t, sizeof(lib_track) * (L->nt + 256));
     lib_track *t = &L->t[L->nt++];
     memset(t, 0, sizeof *t);
+    t->path = t->anlz = "";
     return t;
+}
+
+#define STR_CHUNK (16u * 1024u)
+const char *lib_str(library *L, const char *s)
+{
+    size_t n = strlen(s) + 1;
+    if (n == 1) return "";
+    if (n > L->str_left) {
+        size_t c = n > STR_CHUNK ? n : STR_CHUNK;
+        char *m = malloc(c);
+        if (!m) return "";
+        L->str_at = m; L->str_left = c;
+    }
+    char *o = L->str_at;
+    memcpy(o, s, n);
+    L->str_at += n; L->str_left -= n;
+    return o;
 }
 
 lib_playlist *lib_add_playlist(library *L)

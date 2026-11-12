@@ -27,7 +27,7 @@ src/font5x7.h: tools/mkfont.py
 	python3 tools/mkfont.py > $@
 
 test-deck: | $(B)
-	$(CC) $(CFLAGS) -o $(B)/test_deck tests/test_deck.c src/deck.c src/mp3stream.c src/anlz.c src/util.c -lm && ./$(B)/test_deck
+	$(CC) $(CFLAGS) -o $(B)/test_deck tests/test_deck.c src/deck.c src/mp3stream.c src/anlz.c src/library.c src/util.c -lm && ./$(B)/test_deck
 
 test-app: | $(B)
 	$(CC) $(CFLAGS) -Wno-unused-function -o $(B)/test_app tests/test_app.c src/deck.c src/mp3stream.c src/gfx.c src/anlz.c src/library.c src/util.c -lm && ./$(B)/test_app

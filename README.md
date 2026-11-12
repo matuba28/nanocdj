@@ -33,8 +33,8 @@ firmware for the nano 7G that adds an app launcher, and nanoCDJ is one of its ap
 - **NanoApps** installed on the iPod: see the
   [NanoApps README](https://github.com/nfzerox/NanoApps#readme).
 - **Rekordbox** (any recent version) to export your playlists to the iPod.
-- Your tracks as **MP3**. Other formats load, but play a click on every beat instead of
-  audio (see [Limitations](#limitations)).
+- Your tracks as **MP3**. Other formats are refused with a message (see
+  [Limitations](#limitations)).
 
 ## Install
 
@@ -76,12 +76,14 @@ NanoApps can't stop that. Set your volume before you start.
 
 ## Limitations
 
-- **MP3 only.** Other formats (WAV, AIFF, AAC/M4A, FLAC) play a click on every beat of
-  the Rekordbox grid instead of audio. The deck, loops and jog still work, which is
-  handy for checking a grid, but there's no decoder for them yet.
+- **MP3 only.** Other formats (WAV, AIFF, AAC/M4A, FLAC) don't load: the browser says
+  why ("NOT AN MP3 FILE", and likewise if a file can't be opened or holds no MP3 audio).
+  There's no decoder for them yet.
 - **One deck, one finger.** NanoApps' raw drawing surface reports a single touch point.
-- **Latency** from touch to sound is about 80–100 ms. Fine for beatmatching by ear,
-  noticeable for fast scratching.
+- **Latency.** CUE, PLAY, the loop buttons and touching the jog act on the audio the
+  iPod's mixer hasn't read yet, about 15 ms ahead of what is sounding (plus the frame
+  the touch is seen in). Continuous moves (scratching, pitch bend) are still rendered
+  ~80 ms ahead, which is noticeable for fast scratching.
 - **Loading** takes 0.1–0.3 s. Tracks with very large embedded cover art can take a few
   seconds.
 - A far-away **CUE** is instant (a ~19 s cue buffer), but the deck needs a few seconds to
@@ -120,8 +122,10 @@ Ideas, roughly from most to least requested. Contributions welcome.
 - **Lifting the 2-hour limit.** Find what RetailOS's sound-effect player uses up with
   every buffer start (it's only given back by a restart): by disassembling the
   firmware, or with the NanoApps authors, who reverse-engineered this player.
-- **Lower latency.** Writing closer to the play cursor (now ~80 ms ahead) would make the
-  jog feel tighter. It needs measuring how far ahead the iPod's mixer really reads.
+- **Lower latency.** Transport presses already re-render from the mixer's read position.
+  Doing the same while scratching would make the jog feel tighter, and shorter frames
+  (the screen is redrawn whole every frame; some frames take 30 ms) would get every
+  touch seen sooner.
 - **Search and memory cues.** Search the library by name, and add or remove memory
   cues on the device.
 - **Using the side buttons.** Stop the iPod's system from also acting on the play/pause

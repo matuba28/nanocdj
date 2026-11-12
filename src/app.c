@@ -54,7 +54,9 @@ enum { CTL_NONE, CTL_BACK, CTL_OVERVIEW, CTL_DETAIL, CTL_RANGE, CTL_QUANT, CTL_J
 
 typedef enum { SCR_BROWSE, SCR_DECK } screen_t;
 
-typedef struct { int is_folder, is_track; uint32_t id; char label[128]; char sub[96]; char right[16];
+/* A browser row. The texts point into the library (or at constants): copying them
+ * cost 260 bytes a row, half a MB for a 2,000-track list on the iPod. */
+typedef struct { uint8_t is_folder, is_track; uint32_t id; const char *label, *sub;
                  uint32_t bpm100; int order; } item_t;
 
 /* track-list sorting */
@@ -76,7 +78,8 @@ static struct {
     uint32_t folder_stack[32]; int fsp;   /* stack of folder ids; top is current */
     int in_tracks; uint32_t playlist;     /* showing tracks of `playlist` (0xffffffff = all) */
     char title[96];
-    item_t *items; int nitems;
+    item_t *items; int nitems, items_cap;
+    char all_sub[24];                     /* "N tracks" under ALL TRACKS */
     int scroll, list_save_scroll[32];
 
     const lib_track *cur;
@@ -98,11 +101,23 @@ static void status(const char *s) { snprintf(ui.status, sizeof ui.status, "%s", 
 
 /* ================= browser ================= */
 
+/* room for n rows in all; 0 if there's no memory for them */
+static int reserve_items(int n)
+{
+    if (n <= ui.items_cap) return 1;
+    item_t *p = realloc(ui.items, sizeof(item_t) * (size_t)n);
+    if (!p) return 0;
+    ui.items = p; ui.items_cap = n;
+    return 1;
+}
+
 static item_t *add_item(void)
 {
-    if ((ui.nitems & 63) == 0) ui.items = realloc(ui.items, sizeof(item_t) * (ui.nitems + 64));
-    item_t *it = &ui.items[ui.nitems++];
+    static item_t spare;                  /* out of memory: the row is dropped */
+    item_t *it = &spare;
+    if (ui.nitems < ui.items_cap || reserve_items(ui.items_cap ? ui.items_cap * 2 : 64)) it = &ui.items[ui.nitems++];
     memset(it, 0, sizeof *it);
+    it->label = it->sub = "";
     return it;
 }
 
@@ -112,9 +127,8 @@ static void add_track_item(const lib_track *t)
     it->is_track = 1; it->id = t->id;
     it->bpm100 = t->bpm100;
     it->order = ui.nitems - 1;
-    snprintf(it->label, sizeof it->label, "%s", t->title);
-    snprintf(it->sub, sizeof it->sub, "%s", t->artist);
-    if (t->bpm100) snprintf(it->right, sizeof it->right, "%.1f", t->bpm100 / 100.0);
+    it->label = t->title;
+    it->sub = t->artist;
 }
 
 /* case-insensitive ASCII compare */
@@ -164,6 +178,7 @@ static void build_list(void)
     ui.nitems = 0;
     if (ui.in_tracks) {
         if (ui.playlist == ALL_TRACKS) {
+            reserve_items(L->nt);                      /* one allocation, not a series of doublings */
             for (int i = 0; i < L->nt; i++) add_track_item(&L->t[i]);
         } else {
             for (int i = 0; i < L->ne; i++)
@@ -179,16 +194,17 @@ static void build_list(void)
     if (ui.fsp == 0) {
         item_t *it = add_item();
         it->id = ALL_TRACKS;
-        snprintf(it->label, sizeof it->label, "ALL TRACKS");
-        snprintf(it->sub, sizeof it->sub, "%d tracks", L->nt);
+        it->label = "ALL TRACKS";
+        snprintf(ui.all_sub, sizeof ui.all_sub, "%d tracks", L->nt);
+        it->sub = ui.all_sub;
     }
     for (int i = 0; i < L->np; i++) {
         const lib_playlist *p = &L->p[i];
         if (p->parent != folder) continue;
         item_t *it = add_item();
         it->is_folder = p->is_folder; it->id = p->id;
-        snprintf(it->label, sizeof it->label, "%s", p->name);
-        snprintf(it->sub, sizeof it->sub, "%s", p->is_folder ? "folder" : "playlist");
+        it->label = p->name;
+        it->sub = p->is_folder ? "folder" : "playlist";
     }
 }
 
@@ -216,7 +232,15 @@ static void load_track(const lib_track *t)
     draw_browser();
     gfx_rect(30, 186, 180, 48, C_PANEL); gfx_frame(30, 186, 180, 48, C_ORANGE);
     gfx_text_center(120, 202, "LOADING...", C_ORANGE, 2);
-    if (deck_load(&ui.deck, t->path, t->anlz) != 0) { status("CAN'T OPEN FILE"); return; }
+    if (deck_load(&ui.deck, t->path, t->anlz) != 0) {
+        /* the deck is empty now (the old track is unloaded before the new one is read) */
+        static const char *const why[] = { "CAN'T LOAD TRACK", "NOT AN MP3 FILE", "CAN'T OPEN FILE", "NOT ENOUGH MEMORY", "NO MP3 AUDIO FOUND" };
+        int e = deck_stream_error;
+        status(why[e >= 1 && e <= 4 ? e : 0]);
+        ui.status_until = hal_ticks_ms() + 4000;
+        ui.cur = NULL;
+        return;
+    }
     ui.cur = t;
     ui.scr = SCR_DECK;
     if (!ui.deck.an.nbeats) status("NO BEAT GRID");
@@ -259,8 +283,10 @@ static void draw_browser(void)
         int ix = it->is_folder ? 22 : 6;
         if (it->is_folder) gfx_text(6, y + 7, ">", C_DIM, 2, 0);
         gfx_text(ix, y + 7, it->label, c, 2, SCREEN_W - ix - 4);            /* line 1: title, 2x */
-        int rw = it->right[0] ? gfx_text_w(it->right, 2) + 6 : 0;
-        if (rw) gfx_text(SCREEN_W - rw, y + 27, it->right, loaded ? C_ORANGE : C_DIM, 2, 0);
+        char right[16] = "";
+        if (it->bpm100) snprintf(right, sizeof right, "%.1f", it->bpm100 / 100.0);
+        int rw = right[0] ? gfx_text_w(right, 2) + 6 : 0;
+        if (rw) gfx_text(SCREEN_W - rw, y + 27, right, loaded ? C_ORANGE : C_DIM, 2, 0);
         gfx_text(ix, y + 32, it->sub, C_DIM, 1, SCREEN_W - ix - 8 - rw);   /* line 2: artist + BPM */
         gfx_hline(0, SCREEN_W - 1, y + ROW_H - 1, RGB(30, 30, 34));
     }
@@ -349,8 +375,10 @@ static void draw_detail(const deck_t *d)
     int mid = DT_Y + DT_H / 2;
     gfx_rect(0, DT_Y, SCREEN_W, DT_H, RGB(6, 6, 10));
     const anlz_t *a = &d->an;
-    double per_px = ui.zoom;                    /* waveform entries per pixel */
-    double fpe = AUDIO_RATE / (double)ANLZ_WAVE_PER_SEC; /* frames per entry */
+    /* waveform entries per pixel: same time scale whether or not a long track's
+     * waveform was thinned (wave_div), so possibly under one entry per pixel */
+    double per_px = ui.zoom / (double)(a->wave_div > 1 ? a->wave_div : 1);
+    double fpe = AUDIO_RATE / anlz_wave_rate(a);            /* frames per entry */
     double center = d->pos / fpe;
     double f_left = (center - 120 * per_px) * fpe, f_right = (center + 120 * per_px) * fpe;
 #define F2X(f) (120 + ((f) / fpe - center) / per_px)
@@ -365,7 +393,7 @@ static void draw_detail(const deck_t *d)
         for (int x = 0; x < SCREEN_W; x++) {
             int i0 = (int)floor(center + (x - 120) * per_px);
             int best = -1, bh = -1;
-            for (int k = 0; k < (int)per_px; k++) {
+            for (int k = 0; k < (per_px < 1 ? 1 : (int)per_px); k++) {
                 int i = i0 + k;
                 if (i < 0 || i >= n) continue;
                 int h = a->ncwave ? (a->cwave[i] >> 2) & 31 : a->wave[i] & 31;
@@ -617,6 +645,15 @@ static void seek_overview(int x)
     deck_seek(d, f);
 }
 
+/* A transport control is about to change what should be sounding now. Audio is
+ * rendered a little ahead of what is heard (on the iPod): take that back first, so
+ * the change applies from the audible position and is heard straight away. */
+static void retake(void)
+{
+    unsigned n = hal_audio_rewind();
+    if (n) deck_unrender(&ui.deck, n);
+}
+
 static void touch_down(touch_t *t, int x, int y)
 {
     deck_t *d = &ui.deck;
@@ -636,6 +673,10 @@ static void touch_down(touch_t *t, int x, int y)
     }
     t->ctl = hit_deck(x, y);
     hal_audio_lock();
+    switch (t->ctl) {
+    case CTL_CUE: case CTL_PLAY: case CTL_IN: case CTL_OUT: case CTL_EXIT: case CTL_BEAT: case CTL_JOG: retake(); break;
+    default: break;
+    }
     switch (t->ctl) {
     case CTL_CUE: deck_cue_down(d); break;
     case CTL_PLAY: deck_play_pressed(d); break;
@@ -716,8 +757,8 @@ static void touch_up(touch_t *t)
     }
     hal_audio_lock();
     switch (t->ctl) {
-    case CTL_CUE: deck_cue_up(d); break;
-    case CTL_JOG: deck_jog_touch(d, 0); break;
+    case CTL_CUE: if (d->cue_previewing) retake(); deck_cue_up(d); break;
+    case CTL_JOG: if (d->scrubbing) retake(); deck_jog_touch(d, 0); break;
     case CTL_JOGMODE: if (!t->moved) d->jog_mode = d->jog_mode == JOG_BEND ? JOG_VINYL : JOG_BEND; break;
     case CTL_RANGE:
         if (!t->moved) {
@@ -754,7 +795,7 @@ static void on_button(int b, int down)
 static void audio_cb(float *out, int frames, void *user) { deck_render((deck_t *)user, out, frames); }
 void app_audio_skip(unsigned frames) { deck_skip(&ui.deck, (double)frames); }
 int app_stream_stats(mp3s_stats_t *st) { if (!ui.deck.stream) return 0; mp3s_stats(ui.deck.stream, st); return 1; }
-
+int app_deck_silent(void) { return !ui.deck.loaded || (!ui.deck.playing && !ui.deck.scrubbing); }
 
 void app_init(library *L)
 {
@@ -783,7 +824,6 @@ int app_tick(void)
         }
     }
     hal_audio_lock();
-    deck_service(&ui.deck);          /* read the track ahead of the playhead */
     /* held pitch nudge buttons repeat */
     if (ui.scr == SCR_DECK) {
         uint32_t now = hal_ticks_ms();
@@ -798,6 +838,12 @@ int app_tick(void)
             }
         }
     }
+    hal_audio_unlock();
+    /* Audio first, with the control state just set: reading the track and drawing
+     * take several ms that a press shouldn't have to wait for. */
+    hal_audio_pump();
+    hal_audio_lock();
+    deck_service(&ui.deck);          /* read the track ahead of the playhead */
     hal_audio_unlock();
     /* in the last 10 minutes, a reminder every minute whatever the screen */
     {
@@ -817,4 +863,3 @@ int app_tick(void)
     }
     return !ui.quit;
 }
-

@@ -36,6 +36,7 @@ static void take(voice_t *v, uint8_t *d)
     U8(d, D_PLAYING) = 1;
     U32(d, D_VOICE) = PTR_TO_U32(&sim_voice);
     if (U32(d, D_BUF_LEN) / 4u < SIM_PASS) short_blocks++;
+    sim_voice.remain = U32(d, D_BUF_LEN) / 4u;
 }
 void sim_play(uint8_t *d)
 {
@@ -82,6 +83,11 @@ static void mixer_pass(void)     /* pull one pass from every voice */
         uint32_t at = (fifo_h + fifo_n) % (4 * SIM_PASS);
         fifo[at] = v; fifo_real[at] = (uint8_t)real; fifo_seq[at] = best_seq; fifo_n++;
     }
+    /* like the device: the voice's remaining count moves a pass at a time */
+    for (int k = 0; k < 3; k++) if (vo[k].cur) {
+        uint32_t len = U32(vo[k].cur, D_BUF_LEN) / 4u;
+        sim_voice.remain = vo[k].pos < len ? len - vo[k].pos : 0;
+    }
 }
 
 /* ---- the "speaker" ---- */
@@ -91,9 +97,11 @@ static uint64_t dac_frames;      /* DAC clock: frames output so far */
 static uint32_t last_v;
 
 static uint32_t last_seq; static uint64_t ho_switches; static int64_t ho_disc_max;
+static uint32_t mark_v; static uint64_t mark_heard_at;   /* when a value >= mark_v was first heard */
 static void hear(uint32_t v, int real, uint32_t seq)
 {
     dac_frames++;
+    if (real && mark_v && v >= mark_v && !mark_heard_at) mark_heard_at = dac_frames;
     if (!real) { silent++; return; }
     if (v == 0) { dropouts++; return; }                      /* zeroed buffer: written too late */
     int switched = heard && seq != last_seq;                  /* a handover to a new voice */
@@ -230,6 +238,71 @@ int main(int argc, char **argv)
     dac_rate = 44100.0;
     CHECK(sim_voices_started == 1, "no restarts through drift (%d)", sim_voices_started);
     frames60(60); phase0 = last_phase;
+
+    /* 3b. the lead that jitter pushed up comes back down once frames are punctual */
+    { ring_stats_t ds; ring_stats(&ds);
+      printf("lead after jitter %u ms, after 2 clean minutes %u ms\n", st.lead_ms, ds.lead_ms);
+      CHECK(st.lead_ms <= LEAD_MS || ds.lead_ms < st.lead_ms, "lead decays (%u -> %u ms)", st.lead_ms, ds.lead_ms); }
+
+    /* 3b'. gaps of ~90 ms push the lead up; an announced stall doesn't; and once frames
+     *      are punctual again it comes back down */
+    {
+        ring_stats_t a0, a1, a2, a3; ring_stats(&a0);
+        reset_ears();
+        ring_cover(300); sim_run(250); ring_tick(); frames60(30);   /* e.g. a slow file write */
+        ring_stats(&a1);
+        CHECK(a1.lead_ms == a0.lead_ms, "an announced stall doesn't grow the lead (%u -> %u)", a0.lead_ms, a1.lead_ms);
+        CHECK(dropouts == 0 && repeats == 0 && jumps == 0, "and the audio plays through it: %llu dropouts %llu repeats %llu jumps",
+              (unsigned long long)dropouts, (unsigned long long)repeats, (unsigned long long)jumps);
+        CHECK(llabs(last_phase - phase0) < 45, "in phase after it (%lld frames off)", (long long)(last_phase - phase0));
+        for (int k = 0; k < 6; k++) { sim_run(75); ring_tick(); frames60(30); }   /* (+ the 16 ms before: 91 ms gaps) */
+        ring_stats(&a2);
+        CHECK(a2.lead_ms >= a0.lead_ms + 20, "late ticks grow the lead (%u -> %u)", a0.lead_ms, a2.lead_ms);
+        frames60(60 * 40);
+        ring_stats(&a3);
+        CHECK(a3.lead_ms == a2.lead_ms, "not within the first clean minute (%u -> %u)", a2.lead_ms, a3.lead_ms);
+        frames60(60 * 200);
+        ring_stats(&a3);
+        printf("lead: %u ms, %u after hitches, %u after 4 clean minutes\n", a0.lead_ms, a2.lead_ms, a3.lead_ms);
+        CHECK(a3.lead_ms == LEAD_MS, "lead back to %u ms (%u)", LEAD_MS, a3.lead_ms);
+        frames60(60); phase0 = last_phase;
+    }
+
+    /* 3c. a control change: without a rewind it is heard a whole lead later; with
+     *     one, as soon as the mixer's next pass. The source jumps (a new "track
+     *     position") at the change, and we time when the speaker first plays it. */
+    {
+        double lat[2];
+        for (int rw = 0; rw < 2; rw++) {
+            double worst = 0;
+            for (int k = 0; k < 40; k++) {
+                frames60(7 + k % 5); sim_run((uint32_t)(k % 16));     /* presses land anywhere in a frame / pass */
+                uint32_t taken = rw ? ring_rewind() : 0;
+                counter -= taken;                                     /* the source goes back by what was taken */
+                counter += 500000u; mark_v = counter; mark_heard_at = 0;
+                uint64_t t0 = dac_frames;
+                frames60(20);
+                CHECK(mark_heard_at, "the change was heard");
+                double l = (double)(mark_heard_at - t0) / 44.1;
+                if (l > worst) worst = l;
+            }
+            lat[rw] = worst;
+        }
+        mark_v = 0;
+        ring_stats_t rs; ring_stats(&rs);
+        printf("control change heard after (worst of 40): %.1f ms without rewind, %.1f ms with (%u rewinds, %u from the mixer position, %u ms taken back on average)\n",
+               lat[0], lat[1], rs.rewinds, rs.rewinds_fetch, rs.rewind_ms);
+        CHECK(lat[1] < 70, "rewind: change heard within 70 ms (%.1f)", lat[1]);
+        CHECK(lat[1] + 30 < lat[0], "rewind is faster than waiting out the lead (%.1f vs %.1f)", lat[1], lat[0]);
+        CHECK(rs.rewinds_fetch + 2 >= rs.rewinds && rs.rewinds >= 38, "rewinds used the mixer position, bar one at a block join (%u of %u)", rs.rewinds_fetch, rs.rewinds);
+        ring_stats_t l0; ring_stats(&l0);
+        reset_ears(); frames60(120);
+        CHECK(dropouts == 0 && repeats == 0 && jumps == 0, "steady again after rewinds: %llu dropouts %llu repeats %llu jumps",
+              (unsigned long long)dropouts, (unsigned long long)repeats, (unsigned long long)jumps);
+        ring_stats_t l1; ring_stats(&l1);
+        CHECK(l1.lead_ms <= l0.lead_ms, "rewinds don't grow the lead (%u -> %u)", l0.lead_ms, l1.lead_ms);
+        frames60(60); phase0 = last_phase;
+    }
 
     /* 4. a 150 ms hitch (no frames): goes quiet, then carries on in phase, same voice */
     reset_ears();

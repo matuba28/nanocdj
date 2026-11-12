@@ -8,21 +8,6 @@
 static uint16_t b16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
 static uint32_t b32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 
-typedef void (*tag_fn)(anlz_t *a, const uint8_t *tag, uint32_t hlen, uint32_t tlen, int *have_ext_cues);
-
-static int walk(const uint8_t *b, size_t n, anlz_t *a, tag_fn fn, int *flag)
-{
-    if (n < 12 || memcmp(b, "PMAI", 4) != 0) return -1;
-    size_t o = b32(b + 4);
-    while (o + 12 <= n) {
-        uint32_t hl = b32(b + o + 4), tl = b32(b + o + 8);
-        if (tl < 12 || hl > tl || o + tl > n) break;
-        fn(a, b + o, hl, tl, flag);
-        o += tl;
-    }
-    return 0;
-}
-
 static void add_cue(anlz_t *a, int hot, int type, uint32_t t, uint32_t lt)
 {
     if (a->ncues >= ANLZ_MAX_CUES) return;
@@ -33,32 +18,14 @@ static void add_cue(anlz_t *a, int hot, int type, uint32_t t, uint32_t lt)
     c->loop_ms = c->is_loop ? lt : 0;
 }
 
+/* small tags, handed over whole: preview and cue lists */
 static void on_tag(anlz_t *a, const uint8_t *t, uint32_t hl, uint32_t tl, int *have_ext_cues)
 {
     const uint8_t *body = t + hl, *end = t + tl;
-    if (!memcmp(t, "PQTZ", 4) && hl >= 24 && !a->beats) {
-        uint32_t n = b32(t + 20);
-        if (body + (size_t)n * 8 > end) n = (uint32_t)((end - body) / 8);
-        a->beats = malloc(sizeof(anlz_beat) * (n ? n : 1));
-        for (uint32_t i = 0; i < n; i++) {
-            const uint8_t *e = body + i * 8;
-            a->beats[i] = (anlz_beat){ b32(e + 4), b16(e + 2), (uint8_t)b16(e) };
-        }
-        a->nbeats = (int)n;
-    } else if (!memcmp(t, "PWAV", 4) && hl >= 20) {
+    if (!memcmp(t, "PWAV", 4) && hl >= 20) {
         uint32_t n = b32(t + 12);
         if (n > 400) n = 400;
         if (body + n <= end) { memcpy(a->preview, body, n); a->has_preview = 1; }
-    } else if (!memcmp(t, "PWV3", 4) && hl >= 24 && !a->wave) {
-        uint32_t n = b32(t + 16);
-        if (body + n > end) n = (uint32_t)(end - body);
-        a->wave = malloc(n ? n : 1); memcpy(a->wave, body, n); a->nwave = (int)n;
-    } else if (!memcmp(t, "PWV5", 4) && hl >= 24 && !a->cwave) {
-        uint32_t n = b32(t + 16);
-        if (body + (size_t)n * 2 > end) n = (uint32_t)((end - body) / 2);
-        a->cwave = malloc(sizeof(uint16_t) * (n ? n : 1));
-        for (uint32_t i = 0; i < n; i++) a->cwave[i] = b16(body + i * 2);
-        a->ncwave = (int)n;
     } else if (!memcmp(t, "PCO2", 4) && hl >= 20) {
         /* extended cue list (EXT file), preferred when present */
         int n = b16(t + 16);
@@ -84,6 +51,123 @@ static void on_tag(anlz_t *a, const uint8_t *t, uint32_t hl, uint32_t tl, int *h
     }
 }
 
+/* ---- reading a file forward, tag by tag (hal_file_*: no seek on the iPod) ---- */
+
+typedef struct { void *f; int eof; } rd_t;
+static uint8_t chunk[4096];
+
+static int rd(rd_t *r, void *buf, uint32_t n)       /* exactly n bytes, or -1 */
+{
+    uint8_t *p = (uint8_t *)buf;
+    while (n) {
+        int32_t got = hal_file_read(r->f, p, n);
+        if (got <= 0) { r->eof = 1; return -1; }
+        p += got; n -= (uint32_t)got;
+    }
+    return 0;
+}
+
+static int skip(rd_t *r, uint32_t n)
+{
+    while (n) {
+        uint32_t m = n > sizeof chunk ? sizeof chunk : n;
+        if (rd(r, chunk, m)) return -1;
+        n -= m;
+    }
+    return 0;
+}
+
+/* how many detail entries to fold into one so at most ANLZ_WAVE_MAX are kept */
+static int wave_div_for(uint32_t n) { return n > ANLZ_WAVE_MAX ? (int)((n + ANLZ_WAVE_MAX - 1) / ANLZ_WAVE_MAX) : 1; }
+
+/* Detail waveform (PWV3: 1 byte, PWV5: 2 bytes big-endian per entry), folded
+ * `div` to one by keeping the tallest entry of each group. */
+static int read_wave(rd_t *r, anlz_t *a, uint32_t n, uint32_t body, int two)
+{
+    uint32_t es = two ? 2u : 1u;
+    if ((uint64_t)n * es > body) n = body / es;
+    int div = a->wave_div ? a->wave_div : wave_div_for(n);
+    uint32_t out_n = (n + (uint32_t)div - 1) / (uint32_t)div;
+    void *dst = out_n ? malloc((size_t)out_n * es) : NULL;   /* refused: no waveform, carry on */
+    uint32_t done = 0, best = 0, bh = 0, k = 0;
+    while (done < n) {
+        uint32_t m = (n - done) * es > sizeof chunk ? sizeof chunk / es : n - done;
+        if (rd(r, chunk, m * es)) return -1;
+        for (uint32_t i = 0; dst && i < m; i++) {
+            uint32_t v = two ? b16(chunk + i * 2) : chunk[i];
+            uint32_t h = two ? (v >> 2) & 31 : v & 31;
+            if ((done + i) % (uint32_t)div == 0) { best = v; bh = h; }
+            else if (h > bh) { best = v; bh = h; }
+            if ((done + i) % (uint32_t)div == (uint32_t)div - 1 || done + i == n - 1) {
+                if (two) ((uint16_t *)dst)[k++] = (uint16_t)best; else ((uint8_t *)dst)[k++] = (uint8_t)best;
+            }
+        }
+        done += m;
+    }
+    if (body > n * es && skip(r, body - n * es)) return -1;
+    if (!dst) return 0;
+    a->wave_div = div;
+    if (two) { a->cwave = dst; a->ncwave = (int)k; } else { a->wave = dst; a->nwave = (int)k; }
+    return 0;
+}
+
+static int read_beats(rd_t *r, anlz_t *a, uint32_t n, uint32_t body)
+{
+    if ((uint64_t)n * 8 > body) n = body / 8;
+    anlz_beat *dst = n ? malloc(sizeof(anlz_beat) * n) : NULL;
+    uint32_t done = 0;
+    while (done < n) {
+        uint32_t m = (n - done) * 8 > sizeof chunk ? sizeof chunk / 8 : n - done;
+        if (rd(r, chunk, m * 8)) return -1;
+        for (uint32_t i = 0; dst && i < m; i++) {
+            const uint8_t *e = chunk + i * 8;
+            dst[done + i] = (anlz_beat){ b32(e + 4), b16(e + 2), (uint8_t)b16(e) };
+        }
+        done += m;
+    }
+    if (body > n * 8 && skip(r, body - n * 8)) return -1;
+    if (dst) { a->beats = dst; a->nbeats = (int)n; }
+    return 0;
+}
+
+static int walk_file(const char *path, anlz_t *a, int *have_ext_cues)
+{
+    rd_t r = { hal_file_open(path), 0 };
+    if (!r.f) return -1;
+    uint8_t h[64];
+    int ok = -1;
+    if (rd(&r, h, 12) || memcmp(h, "PMAI", 4)) goto done;
+    uint32_t first = b32(h + 4);
+    if (first < 12 || skip(&r, first - 12)) goto done;
+    ok = 0;
+    for (;;) {
+        if (rd(&r, h, 12)) break;                                  /* end of file */
+        uint32_t hl = b32(h + 4), tl = b32(h + 8);
+        if (tl < 12 || hl < 12 || hl > tl) break;
+        uint32_t hrest = hl > sizeof h ? sizeof h - 12 : hl - 12;
+        if (rd(&r, h + 12, hrest) || (hl > sizeof h && skip(&r, hl - (uint32_t)sizeof h))) break;
+        uint32_t body = tl - hl;
+        int e = 0;
+        if (!memcmp(h, "PQTZ", 4) && hl >= 24 && !a->beats) e = read_beats(&r, a, b32(h + 20), body);
+        else if (!memcmp(h, "PWV3", 4) && hl >= 24 && !a->wave && !a->cwave) e = read_wave(&r, a, b32(h + 16), body, 0);
+        else if (!memcmp(h, "PWV5", 4) && hl >= 24 && !a->cwave) e = read_wave(&r, a, b32(h + 16), body, 1);
+        else if ((!memcmp(h, "PWAV", 4) || !memcmp(h, "PCO2", 4) || !memcmp(h, "PCOB", 4)) && hl <= sizeof h && body <= 65536u) {
+            uint8_t *t = malloc(tl);
+            if (!t) e = skip(&r, body);
+            else {
+                memcpy(t, h, hl);
+                e = rd(&r, t + hl, body);
+                if (!e) on_tag(a, t, hl, tl, have_ext_cues);
+                free(t);
+            }
+        } else e = skip(&r, body);
+        if (e) break;
+    }
+done:
+    hal_file_close(r.f);
+    return ok;
+}
+
 static int cmp_cue(const void *x, const void *y)
 {
     const anlz_cue *a = x, *b = y;
@@ -100,12 +184,11 @@ int anlz_load(anlz_t *a, const char *dat_path)
     if (l > 4) memcpy(ext + l - 4, ".EXT", 4);
 
     int have_ext_cues = 0, ok = 0;
-    size_t n;
     /* EXT first so its richer cue list (PCO2) wins over the DAT's PCOB */
-    uint8_t *b = hal_read_file(ext, &n);
-    if (b) { ok |= walk(b, n, a, on_tag, &have_ext_cues) == 0; free(b); }
-    b = hal_read_file(dat_path, &n);
-    if (b) { ok |= walk(b, n, a, on_tag, &have_ext_cues) == 0; free(b); }
+    ok |= walk_file(ext, a, &have_ext_cues) == 0;
+    ok |= walk_file(dat_path, a, &have_ext_cues) == 0;
+    if (a->cwave && a->wave) { free(a->wave); a->wave = NULL; a->nwave = 0; }   /* color wins; mono unused */
+    if (!a->wave_div) a->wave_div = 1;
     if (a->ncues > 1) qsort(a->cues, (size_t)a->ncues, sizeof(anlz_cue), cmp_cue);
     return ok ? 0 : -1;
 }

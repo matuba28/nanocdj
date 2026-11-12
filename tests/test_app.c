@@ -10,6 +10,9 @@ uint32_t hal_ticks_ms(void) { return now_ms; }
 int hal_audio_start(hal_audio_cb cb, void *u) { (void)cb; (void)u; return 0; }
 void hal_audio_lock(void) {}
 void hal_audio_unlock(void) {}
+static unsigned test_rewind, test_rewinds, test_pumps;   /* frames the next hal_audio_rewind() takes back */
+unsigned hal_audio_rewind(void) { unsigned n = test_rewind; test_rewind = 0; test_rewinds++; return n; }
+void hal_audio_pump(void) { test_pumps++; }
 void *hal_read_file(const char *p, size_t *s) { (void)p; (void)s; return NULL; }
 int hal_decode_audio(const char *p, hal_pcm *o) { (void)p; o->frames = AUDIO_RATE * 60; o->data = calloc((size_t)o->frames * 2, sizeof(float)); return 0; }
 void hal_free_pcm(hal_pcm *p) { free(p->data); p->data = NULL; }
@@ -37,7 +40,7 @@ int main(void)
         t->id = (uint32_t)(i + 1); t->bpm100 = bpms[i];
         snprintf(t->title, sizeof t->title, "%s", titles[i]);
         snprintf(t->artist, sizeof t->artist, "%s", artists[i]);
-        snprintf(t->path, sizeof t->path, "/x/%d.mp3", i + 1);
+        { char pth[32]; snprintf(pth, sizeof pth, "/x/%d.mp3", i + 1); t->path = lib_str(&L, pth); }
     }
     lib_playlist *p = lib_add_playlist(&L); p->id = 7; snprintf(p->name, sizeof p->name, "Warm-up");
     for (int i = 0; i < 3; i++) lib_add_entry(&L, 7, (uint32_t)(i + 1), (uint32_t)i);
@@ -130,6 +133,48 @@ int main(void)
         for (int i = 0; i < 60; i++) { now_ms += 16; app_tick(); }
         ev(EV_TOUCH_UP, mx, my); app_tick();
         CHECK(ui.deck.pitch < held, "holding - lowers pitch");
+    }
+
+    /* transport presses take back the audio rendered ahead, so they act at once */
+    {
+        float buf[2 * 256];
+        deck_t *d = &ui.deck;
+        int cx = JOG_X + BTN_W / 2, cy = BTN_Y + BTN_H / 2;                         /* CUE */
+        int px = cx, py = BTN_Y + BTN_H + 4 + BTN_H / 2;                            /* PLAY */
+        int bx = JOG_X + (BTN_W + 4) + BTN_W / 2, by = py;                          /* 4 BEAT */
+        ui.scr = SCR_DECK;
+        d->playing = 0; d->pos = d->cue; d->loop_active = 0; d->quantize = 0; deck_set_pitch(d, 0);
+        unsigned pumps = test_pumps;
+        now_ms += 1000; tap(px, py);
+        CHECK(d->playing, "play");
+        CHECK(test_pumps > pumps, "audio is pumped from app_tick");
+        for (int i = 0; i < 20; i++) deck_render(d, buf, 256);                      /* 5120 frames rendered ahead... */
+        double heard = d->pos - 3000;                                               /* ...of which 3000 not heard yet */
+        unsigned rw = test_rewinds;
+        test_rewind = 3000;
+        now_ms += 1000; tap(bx, by);
+        CHECK(test_rewinds > rw, "4 BEAT asks for a rewind");
+        CHECK(d->loop_active && fabs(d->loop_in - heard) < 1e-6, "the loop starts where the audio was heard, not where it was rendered to (%.1f)", d->loop_in - heard);
+        for (int i = 0; i < 4; i++) deck_render(d, buf, 256);
+        test_rewind = 1024;
+        now_ms += 1000; tap(cx, cy);
+        CHECK(!d->playing && d->pos == d->cue, "CUE: paused at the cue");
+        /* a pitch nudge is not a transport change: nothing is taken back */
+        rw = test_rewinds;
+        now_ms += 1000; tap(SL_X + SL_W / 2, SL_Y + SL_FINE_H / 2);
+        CHECK(test_rewinds == rw, "pitch nudge doesn't rewind");
+        d->loop_active = 0; d->quantize = 1; deck_set_pitch(d, 0);
+    }
+
+    /* a browser row costs little, and its texts are the library's own */
+    {
+        CHECK(sizeof(item_t) <= 32, "browser row size %zu", sizeof(item_t));
+        ui.scr = SCR_BROWSE; app_tick();
+        for (int i = 0; i < ui.nitems; i++) if (ui.items[i].is_track) {
+            const lib_track *t = lib_find(&L, ui.items[i].id);
+            CHECK(t && ui.items[i].label == t->title && ui.items[i].sub == t->artist, "row %d points at the library", i);
+        }
+        ui.scr = SCR_DECK;
     }
 
     /* the side buttons do nothing in nanoCDJ (the iPod's system owns them) */

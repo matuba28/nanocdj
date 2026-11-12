@@ -21,8 +21,9 @@ src/gfx.c   drawing, built-in 5×8 font                           ─┘
 port/nanoapps/audio_ring.c  PCM out through the OS sound-effect voice (Thumb, integer)
 ```
 
-Everything runs on one thread: each frame handles input, reads a little of the track,
-draws, then renders audio up to a short lead ahead of the play cursor.
+Everything runs on one thread: each frame handles input, renders audio up to a short
+lead ahead of the play cursor, reads a little of the track, draws, then tops the audio
+up again.
 
 ### Thumb / ARM split
 
@@ -59,8 +60,10 @@ What it took on the nano (each found from the trace):
   the voice a stated length doesn't help either (see below).
 - **So blocks are long:** two alternating 6 s blocks (2 × 1.06 MB; 3 s or 1 s if the
   memory isn't there at launch). That's one start per 6 s, ~2 hours per boot. The
-  starts used this boot are saved to `/Data/nanoCDJ/boot.bin` every 30 s, so reopening
-  the app carries the count on; a boot is recognised by RTC time minus the 64-bit
+  starts used this boot are saved to `/Data/nanoCDJ/boot.bin`, so reopening the app
+  carries the count on (within 5 s of a change while the deck is silent; every 30 s
+  while it plays, with 400 ms of audio rendered ahead first, `ring_cover`, so the
+  write to flash is neither heard nor counted as a late frame); a boot is recognised by RTC time minus the 64-bit
   hardware uptime counter. The deck shows a restart countdown from 20 minutes left,
   and at 1,200 starts the ring stops queueing: the audio stops, the iPod doesn't
   crash. (The heap the OS loses while audio plays also dropped, from ~40–90 to ~5
@@ -71,6 +74,25 @@ What it took on the nano (each found from the trace):
   cursor, into blocks the voice is already playing. The voice reads our buffers live.
   The cursor is estimated from the µs clock and re-pinned whenever the "playing" flag
   moves to the next block, so it can't drift (tested against ±120 ppm clock error).
+- **Transport presses don't wait out the lead.** Audio already written ahead used to
+  stand: a CUE or PLAY press was heard a whole lead later. Now the press takes back
+  what the mixer hasn't read yet (`ring_rewind`), the deck undoes that much rendering
+  (`deck_unrender`, from a history of its last render calls), the control is applied,
+  and the same frame renders it again. The mixer's read position comes from the live
+  voice: `voice+0x50` counts down the frames still to pull from the current buffer,
+  in 1024-frame passes. The write point goes back to 256 frames past it. Measured on
+  the device: every rewind was placed from that counter, and took back 61–67 ms of
+  the 80 ms lead. If the counter isn't believable (more than 2048 frames from the
+  clock estimate, or at a block join) the rewind stops 1536 frames past the estimate
+  instead. `NC_RWD` counts both kinds. Scratching and pitch bend don't rewind.
+- **The lead adapts both ways.** A late frame (the cursor passed what was written)
+  adds 10 ms, up to 200 ms. After a minute without one, with every frame gap at least
+  15 ms under the gap that last made it grow, it comes back down 20 ms, then 20 ms
+  more every 30 s, to 80 ms. A hitch that recurs more often than that keeps its lead.
+- **Audio first in the frame.** `app_tick` renders audio (`hal_audio_pump`) straight
+  after handling input, before reading the track and drawing, and the port renders
+  again after the frame: a press doesn't wait for the redraw, and the longest wait
+  between renders is halved.
 - **No length counter.** entrain sets the voice's sample counter (descriptor `+0x34` in
   ms → voice `+0x48`). On this unit the counter is played as silence *after* the PCM:
   stating `frames` made a block take ~193 % of its length, `frames / 2` ~150 %
@@ -147,6 +169,20 @@ tracks. LAME's stated encoder delay is not trimmed.
 - The OS allocator reboots the iPod when an allocation fails, so `malloc` refuses
   anything that would leave less than 256 KB in the largest free block, and the stream
   sizes its buffers from what's free.
+- **The stream's buffers are allocated once.** Window, cue buffer, decoded-frame cache
+  and frame index (~1–2.3 MB) used to be allocated for every track, after the audio
+  ring had taken its 2.1 MB: once the heap had been allocated and freed around for a
+  while, a load could find no piece big enough and the track didn't stream. They are
+  now reserved at launch, before the ring (`mp3s_reserve`, leaving the ring room for
+  its 6 s blocks when there is any), and reused for every track. `NC_MEM` logs it.
+  The old track, analysis included, is freed before the new one is read.
+- **Small library records.** Track paths live in a string store (`lib_str`) instead of
+  two 640-byte arrays per track: ~250 bytes a track instead of 1.5 KB. Browser rows
+  point at the library's strings (28 bytes a row instead of 260).
+- **A track that can't be streamed is refused**, with the reason on screen and in
+  `NC_NOSTR`. (It used to load as beat clicks, the test signal from before there was a
+  decoder.) A failed read is retried on the next frames, up to 30 times, before the
+  file is treated as ended.
 - NanoApps frees the app image when you leave, but not what it allocated from the OS
   heap, and it zeroes the app's statics on the next launch. Without cleanup, each visit
   leaked ~2.5 MB plus an open OS file object, and the iPod rebooted after a couple of
@@ -175,10 +211,12 @@ Read with `python3 tools/trace.py 100 --only NC_` while nanoCDJ is running.
 | `NC_INIT`, `NC_FPU`, `NC_READY` | launch | screen w / FPU context | h / enabled |
 | `NC_PDB` | launch | heap free | largest free block |
 | `NC_LIB` | launch | tracks | playlists |
+| `NC_MEM` | launch | stream buffers reserved | largest free block after |
 | `NC_AUDIO` | launch | audio ring started | largest block |
 | `NC_RING` | every 5 s | voice starts \| late ticks << 16 | mixer rate \| lead ms << 20 |
 | `NC_CAL` | every 5 s | counter divisor (0 = none) \| measurements << 8 | last block time / length, % |
 | `NC_JOIN` | every 5 s | block starts this session \| earlier sessions this boot << 16 | block length, frames |
+| `NC_RWD` | every 5 s | rewinds \| placed from the mixer's read position << 16 | average ms taken back |
 | `NC_BOOT` | launch | block starts used earlier this boot | boot start time, s since 2000 |
 | `NC_HEAP` | every 5 s | heap free | largest free block |
 | `NC_GAP` | every 5 s | longest gap between frames, µs | frames > 25 ms apart |
@@ -186,7 +224,7 @@ Read with `python3 tools/trace.py 100 --only NC_` while nanoCDJ is running.
 | `NC_MP3A` | every 5 s, streaming | KB read in the last 5 s | decode misses (silence) |
 | `NC_MP3B` | every 5 s, streaming | window KB \| reopens << 16 | slowest read in one frame, µs |
 | `NC_MP3C` | every 5 s, streaming | read speed, KB/s | audio read ahead, ms |
-| `NC_NOSTR` | every 5 s, not streaming | why: 1 not MP3, 2 file wouldn't open, 3 no memory, 4 no MP3 frames | 2: path length \| non-ASCII bytes << 16; 4: bytes searched |
+| `NC_NOSTR` | every 5 s, after a refused load | why: 1 not MP3, 2 file wouldn't open, 3 no memory, 4 no MP3 frames | 2: path length \| non-ASCII bytes << 16; 4: bytes searched |
 | `NC_UNLD` | leaving the app | heap blocks freed | heap free after |
 
 If the iPod reboots, NanoApps saves the previous log to `/Library/lasttrace.bin` on the

@@ -27,19 +27,27 @@ void deck_unload(deck_t *d)
 {
     hal_audio_lock();
     mp3s_t *st = d->stream;
-    d->stream = NULL; d->sc_n = 0; d->loaded = 0;
+    hal_pcm pcm = d->pcm;
+    anlz_t an = d->an;
+    d->stream = NULL; d->sc_n = 0; d->loaded = 0; d->hist_n = 0;
+    memset(&d->pcm, 0, sizeof d->pcm);
+    memset(&d->an, 0, sizeof d->an);
     hal_audio_unlock();
     mp3s_close(st);
+    hal_free_pcm(&pcm);
+    anlz_free(&an);
 }
 
 int deck_load(deck_t *d, const char *audio, const char *anlz)
 {
-    /* the old stream goes first: on the iPod there's memory and a file handle for one */
+    /* The old track goes first, all of it: on the iPod there's a file handle for one
+     * stream, and loading the new analysis while the old one is still held leaves
+     * holes in a heap of a few MB. */
     deck_unload(d);
     anlz_t an;
     anlz_load(&an, anlz); /* analysis is optional */
     int entries = an.ncwave ? an.ncwave : an.nwave;
-    double est_s = entries ? (double)entries / ANLZ_WAVE_PER_SEC : 0;
+    double est_s = entries ? (double)entries / anlz_wave_rate(&an) : 0;
     hal_pcm pcm = { 0 };
     mp3s_t *st = NULL;
     int r = 0;
@@ -66,12 +74,19 @@ int deck_load(deck_t *d, const char *audio, const char *anlz)
         int64_t len = mp3s_length(st);                   /* known already for a short file */
         double ratio = mp3s_hz(st) / (double)AUDIO_RATE;
         pcm.frames = len > 0 ? (int64_t)(len / ratio) : est_s > 0 ? (int64_t)(est_s * AUDIO_RATE) : (int64_t)AUDIO_RATE * 600;
-    } else r = hal_decode_audio(audio, &pcm);
+    }
+#ifdef HB_DEVICE
+    /* The iPod has no other decoder. Fail with the reason (deck_stream_error) rather
+     * than load the track as beat clicks, the test signal from before there was one. */
+    else { anlz_free(&an); return -1; }
+#else
+    else r = hal_decode_audio(audio, &pcm);
+#endif
     if (r == HAL_NO_DECODER) {
         /* no decoder on this platform yet: run silently, length from the analysis */
         int entries = an.ncwave ? an.ncwave : an.nwave;
         pcm.data = NULL;
-        pcm.frames = (int64_t)entries * AUDIO_RATE / ANLZ_WAVE_PER_SEC;
+        pcm.frames = (int64_t)(entries * AUDIO_RATE / anlz_wave_rate(&an));
         if (!pcm.frames) { anlz_free(&an); return -1; }
     } else if (r != 0) {
         anlz_free(&an);
@@ -79,8 +94,6 @@ int deck_load(deck_t *d, const char *audio, const char *anlz)
     }
 
     hal_audio_lock();
-    hal_pcm old_pcm = d->pcm;
-    anlz_t old_an = d->an;
     double pitch = d->pitch, range = d->pitch_range;
     int q = d->quantize; jog_mode jm = d->jog_mode;
     memset(d, 0, sizeof *d);
@@ -95,9 +108,6 @@ int deck_load(deck_t *d, const char *audio, const char *anlz)
     if (d->cue == 0 && an.nbeats) d->cue = MS2F(an.beats[0].time_ms);
     d->pos = d->cue;
     hal_audio_unlock();
-
-    hal_free_pcm(&old_pcm);
-    anlz_free(&old_an);
     return 0;
 }
 
@@ -324,7 +334,7 @@ static inline float hermite(float xm1, float x0, float x1, float x2, float t)
     return ((a * t - b) * t + c) * t + x0;
 }
 
-/* ---------------- beat clicks (tracks without a decoder: non-MP3 on the iPod) ---------------- */
+/* ---------------- beat clicks (host builds without a decoder; the tests' signal) ---------------- */
 
 static void click_trigger(deck_t *d, int beat)
 {
@@ -371,6 +381,11 @@ void deck_render(deck_t *d, float *out, int frames)
 
     const hal_pcm *p = &d->pcm;
     double pos = d->pos;
+    int was_playing = d->playing;
+    unsigned hi = d->hist_w++ & (DECK_HIST - 1);
+    d->hist[hi].pos = pos; d->hist[hi].rate = (float)rate;
+    d->hist[hi].frames = (uint16_t)(frames > 65535 ? 65535 : frames); d->hist[hi].stopped = 0;
+    if (d->hist_n < DECK_HIST) d->hist_n++;
     int clicks = !p->data && !d->stream && d->an.nbeats;
     double cur_f = 0, next_f = 0;
     if (clicks) {
@@ -429,6 +444,34 @@ void deck_render(deck_t *d, float *out, int frames)
     }
     d->pos = pos;
     d->click_end_pos = pos;
+    if (was_playing && !d->playing) { d->hist[hi].stopped = 1; d->last_rate = 0; }   /* ran into the end of the track */
+}
+
+void deck_unrender(deck_t *d, unsigned frames)
+{
+    if (!d->loaded) return;
+    while (frames && d->hist_n) {
+        unsigned hi = (d->hist_w - 1) & (DECK_HIST - 1);
+        unsigned n = d->hist[hi].frames;
+        double pos = d->hist[hi].pos, rate = d->hist[hi].rate;
+        if (d->hist[hi].stopped) d->playing = 1;     /* it stopped at the end inside this call: it will again */
+        if (frames >= n) {                           /* the whole call */
+            frames -= n;
+            d->hist_w--; d->hist_n--;
+        } else {                                     /* keep its first n - frames frames */
+            unsigned keep = n - frames;
+            double start = pos;
+            pos += keep * rate;
+            if (d->loop_active && rate > 0 && start < d->loop_out && pos >= d->loop_out) pos -= d->loop_out - d->loop_in;
+            if (pos >= d->pcm.frames) pos = (double)d->pcm.frames - 1;
+            if (pos < 0) pos = 0;
+            d->hist[hi].frames = (uint16_t)keep; d->hist[hi].stopped = 0;
+            frames = 0;
+        }
+        d->pos = pos;
+    }
+    d->click_sync = 0;      /* re-find the beat for the click signal */
+    d->click_env = 0;
 }
 
 /* Advance as if `frames` had been played at the current pitch, without output.

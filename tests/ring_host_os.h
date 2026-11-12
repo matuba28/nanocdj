@@ -12,7 +12,7 @@
 
 #define SIM_PASS 1024u
 
-typedef struct { uint8_t pad[0x0C]; uint32_t out_rate; uint8_t pad2[0x48 - 0x10]; uint32_t counter; } sim_voice_t;
+typedef struct { uint8_t pad[0x0C]; uint32_t out_rate; uint8_t pad2[0x48 - 0x10]; uint32_t counter; uint32_t pad3; uint32_t remain; /* +0x50: frames the mixer has still to pull */ } sim_voice_t;
 
 extern uint32_t sim_now_us;
 extern sim_voice_t sim_voice;

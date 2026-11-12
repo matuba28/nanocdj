@@ -32,6 +32,14 @@ typedef void (*hal_audio_cb)(float *out, int frames, void *user);
 int  hal_audio_start(hal_audio_cb cb, void *user);
 void hal_audio_lock(void);
 void hal_audio_unlock(void);
+/* Platforms that render audio ahead of time from the UI loop (the iPod):
+ * hal_audio_rewind() takes back what is rendered but not yet heard and returns how
+ * many frames that was (the app passes it to deck_unrender before changing the
+ * transport, so the change is heard at once instead of a buffer later);
+ * hal_audio_pump() renders now (the app calls it straight after handling input).
+ * Platforms with a pull callback return 0 / do nothing. */
+unsigned hal_audio_rewind(void);
+void hal_audio_pump(void);
 
 /* ---- files ---- */
 void *hal_read_file(const char *path, size_t *size); /* malloc'd, NULL on failure */
@@ -49,10 +57,11 @@ int hal_audio_time_left_s(void);
 size_t   hal_mem_avail(void); /* the most the app may still allocate in one block */
 
 /* Whole-file decode for formats other than MP3 (MP3s are streamed by
- * src/mp3stream.c). Interleaved stereo float at AUDIO_RATE. The iPod port has no
- * such decoder and returns HAL_NO_DECODER: the deck then plays a click on every
- * beat of the Rekordbox grid, with the length taken from the analysis, so the UI
- * and transport still work. */
+ * src/mp3stream.c). Interleaved stereo float at AUDIO_RATE. A host platform without
+ * one returns HAL_NO_DECODER: the deck then plays a click on every beat of the
+ * Rekordbox grid, with the length taken from the analysis (the tests use this). The
+ * iPod build never calls it: a track that can't be streamed is refused with the
+ * reason (deck_stream_error). */
 #define HAL_NO_DECODER 1
 typedef struct { float *data; int64_t frames; } hal_pcm;
 int  hal_decode_audio(const char *path, hal_pcm *out);
